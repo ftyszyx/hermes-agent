@@ -816,6 +816,51 @@ class TestCodexStreamCallbacks:
 
         assert touch_calls.count("receiving stream response") == 3
 
+    def test_codex_invalid_sse_json_falls_back_to_non_stream_create(self):
+        from run_agent import AIAgent
+
+        fallback_response = SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="fallback from create")],
+            )],
+            status="completed",
+        )
+
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__.side_effect = json.JSONDecodeError(
+            "Expecting value", "", 0
+        )
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = mock_stream
+        mock_client.responses.create.return_value = fallback_response
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/api",
+            model="gpt-5.4",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        request = {
+            "model": "gpt-5.4",
+            "instructions": "You are a helpful coding assistant.",
+            "input": [{"role": "user", "content": "Reply with exactly: OK"}],
+        }
+        response = agent._run_codex_stream(request, client=mock_client)
+
+        assert response is fallback_response
+        assert agent._disable_streaming is True
+        mock_client.responses.create.assert_called_once()
+        mock_client.responses.stream.assert_called_once()
+
     def test_codex_remote_protocol_error_falls_back_to_create_stream(self):
         from run_agent import AIAgent
         import httpx
@@ -849,6 +894,48 @@ class TestCodexStreamCallbacks:
 
         assert response is fallback_response
         mock_fallback.assert_called_once_with({}, client=mock_client)
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_interruptible_codex_call_uses_non_stream_when_disabled(
+        self, mock_close, mock_create
+    ):
+        from run_agent import AIAgent
+
+        fallback_response = SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="non-stream ok")],
+            )],
+            status="completed",
+        )
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = fallback_response
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/api",
+            model="gpt-5.4",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._disable_streaming = True
+        agent._interrupt_requested = False
+
+        request = {
+            "model": "gpt-5.4",
+            "instructions": "You are a helpful coding assistant.",
+            "input": [{"role": "user", "content": "Reply with exactly: OK"}],
+        }
+        response = agent._interruptible_api_call(request)
+
+        assert response is fallback_response
+        mock_client.responses.create.assert_called_once()
+        mock_client.responses.stream.assert_not_called()
 
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent

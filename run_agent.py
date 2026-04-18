@@ -933,6 +933,7 @@ class AIAgent:
         # commentary when the provider later returns it as a completed interim
         # assistant message.
         self._current_streamed_assistant_text = ""
+        self._disable_streaming = False
 
         # Optional current-turn user-message override used when the API-facing
         # user message intentionally differs from the persisted transcript
@@ -4882,6 +4883,19 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except json.JSONDecodeError as exc:
+                if self._has_stream_consumers() and (
+                    self._codex_streamed_text_parts or has_tool_calls
+                ):
+                    raise
+                self._disable_streaming = True
+                logger.info(
+                    "Codex Responses stream emitted invalid SSE JSON; "
+                    "falling back to non-streaming create(). %s error=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                return self._run_codex_create_non_stream(api_kwargs, client=active_client)
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -4916,6 +4930,16 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+
+    def _run_codex_create_non_stream(self, api_kwargs: dict, client: Any = None):
+        """Execute a non-streaming Responses API request for Codex-compatible models."""
+        active_client = client or self._ensure_primary_openai_client(
+            reason="codex_create_non_stream"
+        )
+        request_kwargs = self._preflight_codex_api_kwargs(
+            dict(api_kwargs), allow_stream=False
+        )
+        return active_client.responses.create(**request_kwargs)
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -5262,12 +5286,20 @@ class AIAgent:
         def _call():
             try:
                 if self.api_mode == "codex_responses":
-                    request_client_holder["client"] = self._create_request_openai_client(reason="codex_stream_request")
-                    result["response"] = self._run_codex_stream(
-                        api_kwargs,
-                        client=request_client_holder["client"],
-                        on_first_delta=getattr(self, "_codex_on_first_delta", None),
+                    request_client_holder["client"] = self._create_request_openai_client(
+                        reason="codex_stream_request"
                     )
+                    if getattr(self, "_disable_streaming", False):
+                        result["response"] = self._run_codex_create_non_stream(
+                            api_kwargs,
+                            client=request_client_holder["client"],
+                        )
+                    else:
+                        result["response"] = self._run_codex_stream(
+                            api_kwargs,
+                            client=request_client_holder["client"],
+                            on_first_delta=getattr(self, "_codex_on_first_delta", None),
+                        )
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
                 elif self.api_mode == "bedrock_converse":

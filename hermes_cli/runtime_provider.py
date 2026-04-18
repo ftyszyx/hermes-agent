@@ -49,6 +49,38 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     return None
 
 
+def _model_requires_responses_api(model_name: Any) -> bool:
+    """Return True when a model family generally requires the Responses API."""
+    normalized = str(model_name or "").strip().lower()
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[-1]
+    return normalized.startswith("gpt-5")
+
+
+def _resolve_custom_api_mode(
+    *,
+    base_url: str,
+    explicit_api_mode: Any = None,
+    model_name: Any = None,
+) -> str:
+    """Resolve api_mode for custom OpenAI-compatible endpoints.
+
+    For custom endpoints we still want GPT-5.x models to default to the
+    Responses API unless the user explicitly pinned a different transport.
+    Returning a concrete mode here avoids later runtime layers pinning
+    custom GPT-5 providers to chat_completions too early.
+    """
+    configured_mode = _parse_api_mode(explicit_api_mode)
+    if configured_mode:
+        return configured_mode
+    detected_mode = _detect_api_mode_for_url(base_url)
+    if detected_mode:
+        return detected_mode
+    if _model_requires_responses_api(model_name):
+        return "codex_responses"
+    return "chat_completions"
+
+
 def _auto_detect_local_model(base_url: str) -> str:
     """Query a local server for its model name when only one model is loaded."""
     if not base_url:
@@ -380,6 +412,7 @@ def _resolve_named_custom_runtime(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    model_cfg = _get_model_config()
     custom_provider = _get_named_custom_provider(requested_provider)
     if not custom_provider:
         return None
@@ -391,8 +424,15 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
+    model_name = custom_provider.get("model") or model_cfg.get("default", "")
+    api_mode = _resolve_custom_api_mode(
+        base_url=base_url,
+        explicit_api_mode=custom_provider.get("api_mode"),
+        model_name=model_name,
+    )
+
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    pool_result = _try_resolve_from_custom_pool(base_url, "custom", api_mode)
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -412,9 +452,7 @@ def _resolve_named_custom_runtime(
 
     result = {
         "provider": "custom",
-        "api_mode": custom_provider.get("api_mode")
-        or _detect_api_mode_for_url(base_url)
-        or "chat_completions",
+        "api_mode": api_mode,
         "base_url": base_url,
         "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
@@ -500,11 +538,18 @@ def _resolve_openrouter_runtime(
     # Also provide a placeholder API key for local servers that don't require
     # authentication — the OpenAI SDK requires a non-empty api_key string.
     effective_provider = "custom" if requested_norm == "custom" else "openrouter"
+    custom_api_mode = None
+    if effective_provider == "custom":
+        custom_api_mode = _resolve_custom_api_mode(
+            base_url=base_url,
+            explicit_api_mode=model_cfg.get("api_mode"),
+            model_name=model_cfg.get("default", ""),
+        )
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
         pool_result = _try_resolve_from_custom_pool(
-            base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
+            base_url, effective_provider, custom_api_mode,
         )
         if pool_result:
             return pool_result
@@ -514,9 +559,11 @@ def _resolve_openrouter_runtime(
 
     return {
         "provider": effective_provider,
-        "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
-        or _detect_api_mode_for_url(base_url)
-        or "chat_completions",
+        "api_mode": custom_api_mode if effective_provider == "custom" else (
+            _parse_api_mode(model_cfg.get("api_mode"))
+            or _detect_api_mode_for_url(base_url)
+            or "chat_completions"
+        ),
         "base_url": base_url,
         "api_key": api_key,
         "source": source,
