@@ -23,28 +23,55 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Activate venv ───────────────────────────────────────────────────────────
+# ── Locate venv Python ──────────────────────────────────────────────────────
 # Prefer a .venv in the current tree, fall back to the main checkout's venv
-# (useful for worktrees where we don't always duplicate the venv).
+# (useful for worktrees where we don't always duplicate the venv). Support
+# both Unix-style virtualenvs and Windows .venv\Scripts layouts when the
+# wrapper is run via Git Bash.
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+PYTHON=""
+for candidate in \
+  "$REPO_ROOT/.venv" \
+  "$REPO_ROOT/venv" \
+  "$HOME/.hermes/hermes-agent/.venv" \
+  "$HOME/.hermes/hermes-agent/venv"
+do
+  if [ -f "$candidate/bin/python" ]; then
     VENV="$candidate"
+    PYTHON="$candidate/bin/python"
+    break
+  fi
+  if [ -f "$candidate/Scripts/python.exe" ]; then
+    VENV="$candidate"
+    PYTHON="$candidate/Scripts/python.exe"
     break
   fi
 done
 
-if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+if [ -z "$PYTHON" ]; then
+  echo "error: no virtualenv found with bin/python or Scripts/python.exe in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
   exit 1
 fi
 
-PYTHON="$VENV/bin/python"
+# ── Ensure test runner deps are installed ──────────────────────────────────
+# Some local setups sync only runtime deps (for example `uv sync` without the
+# dev group / extras). Make the canonical wrapper self-healing so it can still
+# enforce CI-parity flags without asking the user to switch tools.
+# Keep these versions aligned with [project.optional-dependencies].dev in
+# pyproject.toml, but install them directly so Windows doesn't need to
+# reinstall the editable project and replace .venv\Scripts\hermes.exe.
+if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+  echo "→ bootstrapping pip into $VENV"
+  "$PYTHON" -m ensurepip --upgrade >/dev/null
+fi
 
-# ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
-if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
-  echo "→ installing pytest-split into $VENV"
-  "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
+if ! "$PYTHON" -c "import pytest, pytest_asyncio, xdist, pytest_split" 2>/dev/null; then
+  echo "→ installing test runner dependencies into $VENV"
+  "$PYTHON" -m pip install --quiet \
+    "pytest>=9.0.2,<10" \
+    "pytest-asyncio>=1.3.0,<2" \
+    "pytest-xdist>=3.0,<4" \
+    "pytest-split>=0.9,<1"
 fi
 
 # ── Hermetic environment ────────────────────────────────────────────────────

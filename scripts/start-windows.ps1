@@ -1,6 +1,6 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet("chat", "gateway", "setup", "doctor", "model", "config", "custom")]
+    [ValidateSet("chat", "gateway", "dashboard", "setup", "doctor", "model", "config", "custom")]
     [string]$Mode = "chat",
 
     [string]$RepoRoot = "",
@@ -224,6 +224,9 @@ function Build-HermesCommandArgs {
         "gateway" {
             return $baseArgs + @("gateway", "run") + $ExtraArgs
         }
+        "dashboard" {
+            return $baseArgs + @("dashboard") + $ExtraArgs
+        }
         "setup" {
             return $baseArgs + @("setup") + $ExtraArgs
         }
@@ -250,19 +253,26 @@ function Build-HermesCommandArgs {
 function Get-HermesPythonCheckResult {
     param(
         [string]$PythonCommand,
-        [string[]]$PrefixArgs
+        [string[]]$PrefixArgs,
+        [string]$LaunchMode = "chat"
     )
 
+    $requiredModules = @("yaml", "rich", "prompt_toolkit", "dotenv")
+    if ($LaunchMode -eq "dashboard") {
+        $requiredModules += @("fastapi", "uvicorn")
+    }
+
+    $requiredJson = ($requiredModules | ConvertTo-Json -Compress)
     $probeCode = @'
 import importlib.util
 import json
 import sys
 
-required = ["yaml", "rich", "prompt_toolkit", "dotenv"]
+required = __REQUIRED_MODULES__
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 print(json.dumps({"missing": missing}))
 sys.exit(0 if not missing else 3)
-'@
+'@.Replace("__REQUIRED_MODULES__", $requiredJson)
 
     $probeFile = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-python-probe-" + [System.Guid]::NewGuid().ToString("N") + ".py")
     Set-Content -LiteralPath $probeFile -Value $probeCode -Encoding UTF8
@@ -302,19 +312,25 @@ sys.exit(0 if not missing else 3)
 function Test-HermesPythonReady {
     param(
         [string]$PythonCommand,
-        [string[]]$PrefixArgs
+        [string[]]$PrefixArgs,
+        [string]$LaunchMode = "chat"
     )
 
-    $check = Get-HermesPythonCheckResult -PythonCommand $PythonCommand -PrefixArgs $PrefixArgs
+    $check = Get-HermesPythonCheckResult -PythonCommand $PythonCommand -PrefixArgs $PrefixArgs -LaunchMode $LaunchMode
     if ($check.Ready) {
         return
+    }
+
+    $installHint = "uv pip install -e "".[all]"""
+    if ($LaunchMode -eq "dashboard") {
+        $installHint = "uv pip install -e "".[web]"""
     }
 
     if ($check.Missing.Count -gt 0) {
         $missingList = $check.Missing -join ", "
         throw (
             "Python launcher '$PythonCommand' is missing Hermes dependencies: $missingList.`n" +
-            "Run scripts/install.ps1 first, or install the repo into a venv with: uv pip install -e '.[all]'"
+            "Run scripts/install.ps1 first, or install the repo into a venv with: $installHint"
         )
     }
 
@@ -337,7 +353,9 @@ function Install-HermesRuntime {
     $uvCommand = Find-UvCommand
 
     $installSpecs = @(".[all]", ".")
-    if ($LaunchMode -eq "gateway") {
+    if ($LaunchMode -eq "dashboard") {
+        $installSpecs = @(".[web]", ".[all]", ".")
+    } elseif ($LaunchMode -eq "gateway") {
         $installSpecs = @(".[all]", ".[messaging,cron,mcp,honcho,acp,web]", ".")
     }
 
@@ -484,10 +502,10 @@ if ($PrintOnly) {
 
 Push-Location $resolvedRepoRoot
 try {
-    $check = Get-HermesPythonCheckResult -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix
+    $check = Get-HermesPythonCheckResult -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix -LaunchMode $Mode
     if (-not $check.Ready) {
         if ($NoBootstrap -or $NoVenv) {
-            Test-HermesPythonReady -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix
+            Test-HermesPythonReady -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix -LaunchMode $Mode
         }
 
         if ($check.Missing.Count -gt 0) {
@@ -505,9 +523,9 @@ try {
             -LaunchMode $Mode
 
         Write-Info "Python: $($launcher.Command)"
-        $check = Get-HermesPythonCheckResult -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix
+        $check = Get-HermesPythonCheckResult -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix -LaunchMode $Mode
         if (-not $check.Ready) {
-            Test-HermesPythonReady -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix
+            Test-HermesPythonReady -PythonCommand $launcher.Command -PrefixArgs $launcher.Prefix -LaunchMode $Mode
         }
     }
 

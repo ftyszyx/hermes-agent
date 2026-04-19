@@ -6222,7 +6222,13 @@ def cmd_dashboard(args):
         import uvicorn  # noqa: F401
     except ImportError:
         print("Web UI dependencies not installed.")
-        print(f"Install them with:  {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'")
+        if (PROJECT_ROOT / "pyproject.toml").exists():
+            print(
+                f'From the repo root run:  {sys.executable} -m pip install -e ".[web]"'
+            )
+        print(
+            f'Or install the direct packages with:  {sys.executable} -m pip install fastapi "uvicorn[standard]"'
+        )
         sys.exit(1)
 
     if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):

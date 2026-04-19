@@ -11,6 +11,7 @@ import pytest
 from tools.browser_tool import (
     _discover_homebrew_node_dirs,
     _find_agent_browser,
+    _parse_browser_json,
     _run_browser_command,
     _SANE_PATH,
     check_browser_requirements,
@@ -444,6 +445,39 @@ class TestRunBrowserCommandPathConstruction:
         result_path = captured_env.get("PATH", "")
         assert "/opt/homebrew/bin" in result_path
         assert "/opt/homebrew/sbin" in result_path
+
+    def test_run_browser_command_recovers_wrapped_json_output(self, tmp_path):
+        """Wrapped prompt noise should not prevent JSON parsing on Windows."""
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.wait.return_value = 0
+
+        fake_session = {
+            "session_name": "test-session",
+            "session_id": "test-id",
+            "cdp_url": None,
+        }
+        wrapped = 'Terminate batch job (Y/N)?\\n{"success": true, "data": {"title": "ok"}}'
+
+        with patch("tools.browser_tool._find_agent_browser", return_value="npx agent-browser"), \
+             patch("tools.browser_tool._get_session_info", return_value=fake_session), \
+             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("os.open", return_value=99), \
+             patch("os.close"), \
+             patch("tools.interrupt.is_interrupted", return_value=False):
+            with patch("builtins.open", mock_open(read_data=wrapped)):
+                result = _run_browser_command("test-task", "navigate", ["https://example.com"])
+
+        assert result["success"] is True
+        assert result["data"]["title"] == "ok"
+
+    def test_parse_browser_json_handles_embedded_payload(self):
+        wrapped = '终止批处理操作吗(Y/N)?\\n{"success": true, "data": {"title": "wrapped"}}'
+        parsed = _parse_browser_json(wrapped)
+        assert parsed is not None
+        assert parsed["success"] is True
+        assert parsed["data"]["title"] == "wrapped"
 
     def test_subprocess_path_includes_termux_fallback_dirs(self, tmp_path):
         """Termux fallback dirs should survive browser PATH rebuilding."""

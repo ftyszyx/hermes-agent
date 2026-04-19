@@ -200,6 +200,32 @@ def _get_command_timeout() -> int:
     return result
 
 
+def _parse_browser_json(raw_text: str) -> Optional[Dict[str, Any]]:
+    """Parse agent-browser JSON, tolerating wrapped prompt noise on Windows.
+
+    Some Windows launches can prepend or append console prompt text around the
+    real JSON payload (for example a batch-job termination prompt from `npx`).
+    Try direct parsing first, then scan for the first embedded JSON object.
+    """
+    try:
+        parsed = json.loads(raw_text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(raw_text):
+        if ch != "{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(raw_text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _get_vision_model() -> Optional[str]:
     """Model for browser_vision (screenshot analysis — multimodal)."""
     return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
@@ -1211,9 +1237,9 @@ def _run_browser_command(
                            command, timeout, task_id, task_socket_dir)
             return {"success": False, "error": f"Command timed out after {timeout} seconds"}
 
-        with open(stdout_path, "r") as f:
+        with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
             stdout = f.read()
-        with open(stderr_path, "r") as f:
+        with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
             stderr = f.read()
         returncode = proc.returncode
 
@@ -1239,8 +1265,13 @@ def _run_browser_command(
             return {"success": False, "error": f"Browser command '{command}' returned no output"}
 
         if stdout_text:
-            try:
-                parsed = json.loads(stdout_text)
+            parsed = _parse_browser_json(stdout_text)
+            if parsed is not None:
+                if stdout_text.lstrip()[:1] != "{":
+                    logger.info(
+                        "browser '%s' recovered JSON payload from wrapped stdout",
+                        command,
+                    )
                 # Warn if snapshot came back empty (common sign of daemon/CDP issues)
                 if command == "snapshot" and parsed.get("success"):
                     snap_data = parsed.get("data", {})
@@ -1249,35 +1280,34 @@ def _run_browser_command(
                                        "Possible stale daemon or CDP connection issue. "
                                        "returncode=%s", returncode)
                 return parsed
-            except json.JSONDecodeError:
-                raw = stdout_text[:2000]
-                logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
-                               command, returncode, raw[:500])
+            raw = stdout_text[:2000]
+            logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
+                           command, returncode, raw[:500])
 
-                if command == "screenshot":
-                    stderr_text = (stderr or "").strip()
-                    combined_text = "\n".join(
-                        part for part in [stdout_text, stderr_text] if part
+            if command == "screenshot":
+                stderr_text = (stderr or "").strip()
+                combined_text = "\n".join(
+                    part for part in [stdout_text, stderr_text] if part
+                )
+                recovered_path = _extract_screenshot_path_from_text(combined_text)
+
+                if recovered_path and Path(recovered_path).exists():
+                    logger.info(
+                        "browser 'screenshot' recovered file from non-JSON output: %s",
+                        recovered_path,
                     )
-                    recovered_path = _extract_screenshot_path_from_text(combined_text)
+                    return {
+                        "success": True,
+                        "data": {
+                            "path": recovered_path,
+                            "raw": raw,
+                        },
+                    }
 
-                    if recovered_path and Path(recovered_path).exists():
-                        logger.info(
-                            "browser 'screenshot' recovered file from non-JSON output: %s",
-                            recovered_path,
-                        )
-                        return {
-                            "success": True,
-                            "data": {
-                                "path": recovered_path,
-                                "raw": raw,
-                            },
-                        }
-
-                return {
-                    "success": False,
-                    "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
-                }
+            return {
+                "success": False,
+                "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
+            }
         
         # Check for errors
         if returncode != 0:

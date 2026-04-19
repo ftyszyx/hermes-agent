@@ -24,6 +24,12 @@ if /I "%~1"=="gateway" (
     goto run_mode
 )
 
+if /I "%~1"=="dashboard" (
+    set "TARGET_MODE=dashboard"
+    shift
+    goto run_mode
+)
+
 if /I "%~1"=="setup" (
     set "TARGET_MODE=setup"
     shift

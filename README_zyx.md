@@ -17,7 +17,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 如果你已经自己建好了虚拟环境，也可以直接安装依赖：
 
 ```powershell
-uv pip install -e ".[all]"
+# uv pip install -e ".[all]"
+uv sync --extra web
 ```
 
 ## 2. 一键启动
@@ -59,6 +60,18 @@ start-hermes.bat
 start-hermes.bat gateway
 ```
 
+### 启动 Web UI 控制台
+
+```bat
+start-hermes.bat dashboard
+```
+
+默认会打开本地地址 `http://127.0.0.1:9119`。如果你不想自动打开浏览器，可以这样运行：
+
+```bat
+start-hermes.bat dashboard --no-open
+```
+
 ### 打开初始化向导
 
 ```bat
@@ -97,6 +110,7 @@ scripts/start-windows.ps1
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -Mode gateway
+powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -Mode dashboard
 powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -Mode custom gateway status
 ```
 
@@ -121,9 +135,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -Mode custo
 
 比如缺少 `yaml`、`prompt_toolkit`、`dotenv`，说明当前 Python 不是 Hermes 的可用环境。
 
+如果是启动 Web UI 时提示缺少 `fastapi` 或 `uvicorn`，也属于同一类问题。
+
 现在默认行为是：
 
 - `start-hermes.bat`
+- `start-hermes.bat dashboard`
 - `scripts/start-windows.ps1`
 
 都会优先尝试自动创建 `.venv` 并安装依赖。
@@ -163,6 +180,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -HermesHome
 
 - 日常聊天：直接双击 `start-hermes.bat`
 - 手动跑 gateway：`start-hermes.bat gateway`
+- 打开 Web UI：`start-hermes.bat dashboard`
 - 要查问题：`start-hermes.bat doctor`
 
 如果后面还需要，我可以继续补：
@@ -171,18 +189,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -HermesHome
 - 自动优先使用 `venv` 的安装/修复脚本
 - Windows 下更完整的原生兼容说明
 
-
-
-
 配置
 model:
-  default: gpt-5.4
-  provider: custom
-  base_url: https://gpt-proxy-usa-pub.singularity-ai.com/gpt-proxy/api
-  api_key: 你的key
-  api_mode: codex_responses
+default: gpt-5.4
+provider: custom
+base_url: https://gpt-proxy-usa-pub.singularity-ai.com/gpt-proxy/api
+api_key: 你的key
+api_mode: codex_responses
 
 custom_providers:
+
 - name: kunlun-sky
   base_url: https://gpt-proxy-usa-pub.singularity-ai.com/gpt-proxy/api
   api_key: 你的key

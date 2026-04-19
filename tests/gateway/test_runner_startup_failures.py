@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -185,11 +187,11 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
             return None
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
+    monkeypatch.setattr("gateway.status.is_pid_running", lambda pid: True)
     monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
     monkeypatch.setattr("gateway.status.release_all_scoped_locks", lambda: 0)
     monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, force=False: calls.append((pid, force)))
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
-    monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
     monkeypatch.setattr("time.sleep", lambda _: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
@@ -254,16 +256,12 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
             return None
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
+    monkeypatch.setattr("gateway.status.is_pid_running", lambda pid: False)
     monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
     monkeypatch.setattr("gateway.status.release_all_scoped_locks", lambda: 0)
     monkeypatch.setattr("gateway.status.write_takeover_marker", record_write_marker)
     monkeypatch.setattr("gateway.status.terminate_pid", record_terminate)
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
-    # Simulate old process exiting on first check so we don't loop into force-kill
-    monkeypatch.setattr(
-        "gateway.run.os.kill",
-        lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()),
-    )
     monkeypatch.setattr("time.sleep", lambda _: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
@@ -319,3 +317,48 @@ async def test_start_gateway_replace_clears_marker_on_permission_denied(
     assert ok is False
     # Marker must NOT be left behind
     assert not (tmp_path / ".gateway-takeover.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_cancellation_stops_runner_cleanly(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    events = []
+
+    class _CancelledRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = False
+            self.exit_reason = None
+            self.exit_code = None
+            self._restart_requested = False
+            self.adapters = {}
+
+        async def start(self):
+            events.append("start")
+            return True
+
+        async def stop(self):
+            events.append("stop")
+
+        async def wait_for_shutdown(self):
+            events.append("wait")
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "gateway.run._start_cron_ticker",
+        lambda stop_event, adapters=None, loop=None: stop_event.wait(0.01),
+    )
+    monkeypatch.setattr("gateway.run.GatewayRunner", _CancelledRunner)
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+    assert ok is True
+    assert events == ["start", "wait", "stop"]

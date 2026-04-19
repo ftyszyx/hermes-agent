@@ -81,6 +81,39 @@ class TestGatewayPidState:
         assert status.get_running_pid(pid_path, cleanup_stale=False) == os.getpid()
         assert pid_path.exists()
 
+    def test_get_running_pid_uses_windows_pid_probe(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid_path = tmp_path / "gateway.pid"
+        pid_path.write_text(json.dumps({
+            "pid": 4321,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 123,
+        }))
+
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+        monkeypatch.setattr(status, "_pid_exists_windows", lambda pid: pid == 4321)
+        monkeypatch.setattr(status.os, "kill", lambda pid, sig: (_ for _ in ()).throw(AssertionError("os.kill should not be used on Windows")))
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
+
+        assert status.get_running_pid() == 4321
+
+    def test_get_running_pid_cleans_stale_windows_pid(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid_path = tmp_path / "gateway.pid"
+        pid_path.write_text(json.dumps({
+            "pid": 9876,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+        }))
+
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+        monkeypatch.setattr(status, "_pid_exists_windows", lambda pid: False)
+
+        assert status.get_running_pid() is None
+        assert not pid_path.exists()
+
 
 class TestGatewayRuntimeStatus:
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
@@ -197,7 +230,7 @@ class TestScopedLocks:
             "kind": "hermes-gateway",
         }))
 
-        monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "is_pid_running", lambda pid: True)
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
 
         acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
@@ -215,10 +248,7 @@ class TestScopedLocks:
             "kind": "hermes-gateway",
         }))
 
-        def fake_kill(pid, sig):
-            raise ProcessLookupError
-
-        monkeypatch.setattr(status.os, "kill", fake_kill)
+        monkeypatch.setattr(status, "is_pid_running", lambda pid: False)
 
         acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
 

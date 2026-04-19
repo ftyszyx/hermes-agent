@@ -10135,7 +10135,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
     import time as _time
-    from gateway.status import get_running_pid, remove_pid_file, terminate_pid
+    from gateway.status import get_running_pid, is_pid_running, remove_pid_file, terminate_pid
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
@@ -10172,11 +10172,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 return False
             # Wait up to 10 seconds for the old process to exit
             for _ in range(20):
-                try:
-                    os.kill(existing_pid, 0)
-                    _time.sleep(0.5)
-                except (ProcessLookupError, PermissionError):
+                if not is_pid_running(existing_pid):
                     break  # Process is gone
+                _time.sleep(0.5)
             else:
                 # Still alive after 10s — force kill
                 logger.warning(
@@ -10327,51 +10325,66 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     else:
         logger.info("Skipping signal handlers (not running in main thread).")
     
-    # Start the gateway
-    success = await runner.start()
-    if not success:
-        return False
-    if runner.should_exit_cleanly:
-        if runner.exit_reason:
-            logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
-        return True
-    
-    # Write PID file so CLI can detect gateway is running
-    import atexit
-    from gateway.status import write_pid_file, remove_pid_file
-    write_pid_file()
-    atexit.register(remove_pid_file)
-    
-    # Start background cron ticker so scheduled jobs fire automatically.
-    # Pass the event loop so cron delivery can use live adapters (E2EE support).
-    cron_stop = threading.Event()
-    cron_thread = threading.Thread(
-        target=_start_cron_ticker,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-ticker",
-    )
-    cron_thread.start()
-    
-    # Wait for shutdown
-    await runner.wait_for_shutdown()
+    cron_stop: Optional[threading.Event] = None
+    cron_thread: Optional[threading.Thread] = None
+
+    try:
+        # Start the gateway
+        success = await runner.start()
+        if not success:
+            return False
+        if runner.should_exit_cleanly:
+            if runner.exit_reason:
+                logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
+            return True
+
+        # Write PID file so CLI can detect gateway is running
+        import atexit
+        from gateway.status import write_pid_file, remove_pid_file
+        write_pid_file()
+        atexit.register(remove_pid_file)
+
+        # Start background cron ticker so scheduled jobs fire automatically.
+        # Pass the event loop so cron delivery can use live adapters (E2EE support).
+        cron_stop = threading.Event()
+        cron_thread = threading.Thread(
+            target=_start_cron_ticker,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="cron-ticker",
+        )
+        cron_thread.start()
+
+        # Wait for shutdown
+        await runner.wait_for_shutdown()
+    except asyncio.CancelledError:
+        # Windows commonly falls back to task cancellation for Ctrl+C because
+        # add_signal_handler() is unavailable there. Make sure we still run the
+        # normal gateway shutdown path so adapter disconnect hooks release their
+        # scoped locks before the process exits.
+        logger.info(
+            "Gateway shutdown requested via task cancellation; stopping gracefully."
+        )
+        await runner.stop()
+    finally:
+        # Stop cron ticker cleanly
+        if cron_stop is not None:
+            cron_stop.set()
+        if cron_thread is not None:
+            cron_thread.join(timeout=5)
+
+        # Close MCP server connections
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron ticker cleanly
-    cron_stop.set()
-    cron_thread.join(timeout=5)
-
-    # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
