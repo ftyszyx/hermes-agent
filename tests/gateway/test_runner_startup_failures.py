@@ -186,9 +186,17 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
         async def stop(self):
             return None
 
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
+    _pid_state = {"alive": True}
+
+    def _mock_get_running_pid():
+        return 42 if _pid_state["alive"] else None
+
+    def _mock_remove_pid_file():
+        _pid_state["alive"] = False
+
+    monkeypatch.setattr("gateway.status.get_running_pid", _mock_get_running_pid)
     monkeypatch.setattr("gateway.status.is_pid_running", lambda pid: True)
-    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", _mock_remove_pid_file)
     monkeypatch.setattr("gateway.status.release_all_scoped_locks", lambda: 0)
     monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, force=False: calls.append((pid, force)))
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
@@ -255,9 +263,17 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
         async def stop(self):
             return None
 
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
+    _pid_state = {"alive": True}
+
+    def _mock_get_running_pid():
+        return 42 if _pid_state["alive"] else None
+
+    def _mock_remove_pid_file():
+        _pid_state["alive"] = False
+
+    monkeypatch.setattr("gateway.status.get_running_pid", _mock_get_running_pid)
     monkeypatch.setattr("gateway.status.is_pid_running", lambda pid: False)
-    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", _mock_remove_pid_file)
     monkeypatch.setattr("gateway.status.release_all_scoped_locks", lambda: 0)
     monkeypatch.setattr("gateway.status.write_takeover_marker", record_write_marker)
     monkeypatch.setattr("gateway.status.terminate_pid", record_terminate)
@@ -362,3 +378,23 @@ async def test_start_gateway_cancellation_stops_runner_cleanly(monkeypatch, tmp_
 
     assert ok is True
     assert events == ["start", "wait", "stop"]
+
+
+def test_runner_warns_when_docker_gateway_lacks_explicit_output_mount(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", '["/etc/localtime:/etc/localtime:ro"]')
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+
+    with caplog.at_level("WARNING"):
+        GatewayRunner(config)
+
+    assert any(
+        "host-visible output mount" in record.message
+        for record in caplog.records
+    )
