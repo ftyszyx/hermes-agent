@@ -52,6 +52,16 @@ _CONTEXT_INVISIBLE_CHARS = {
 }
 
 
+def _read_context_file(path: Path) -> str:
+    """Read a context file as UTF-8 and drop a leading BOM if present.
+
+    Windows-authored UTF-8 files are commonly saved with a BOM. Treat that as
+    a file-encoding detail rather than prompt-injection content so legitimate
+    SOUL.md / AGENTS.md files do not get blocked just for their first byte.
+    """
+    return path.read_text(encoding="utf-8-sig").strip()
+
+
 def _scan_context_content(content: str, filename: str) -> str:
     """Scan context file content for injection. Returns sanitized content."""
     findings = []
@@ -914,7 +924,7 @@ def load_soul_md() -> Optional[str]:
     if not soul_path.exists():
         return None
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
+        content = _read_context_file(soul_path)
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
@@ -931,7 +941,7 @@ def _load_hermes_md(cwd_path: Path) -> str:
     if not hermes_md_path:
         return ""
     try:
-        content = hermes_md_path.read_text(encoding="utf-8").strip()
+        content = _read_context_file(hermes_md_path)
         if not content:
             return ""
         content = _strip_yaml_frontmatter(content)
@@ -954,7 +964,7 @@ def _load_agents_md(cwd_path: Path) -> str:
         candidate = cwd_path / name
         if candidate.exists():
             try:
-                content = candidate.read_text(encoding="utf-8").strip()
+                content = _read_context_file(candidate)
                 if content:
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
@@ -970,7 +980,7 @@ def _load_claude_md(cwd_path: Path) -> str:
         candidate = cwd_path / name
         if candidate.exists():
             try:
-                content = candidate.read_text(encoding="utf-8").strip()
+                content = _read_context_file(candidate)
                 if content:
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
@@ -986,7 +996,7 @@ def _load_cursorrules(cwd_path: Path) -> str:
     cursorrules_file = cwd_path / ".cursorrules"
     if cursorrules_file.exists():
         try:
-            content = cursorrules_file.read_text(encoding="utf-8").strip()
+            content = _read_context_file(cursorrules_file)
             if content:
                 content = _scan_context_content(content, ".cursorrules")
                 cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
@@ -998,7 +1008,7 @@ def _load_cursorrules(cwd_path: Path) -> str:
         mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
         for mdc_file in mdc_files:
             try:
-                content = mdc_file.read_text(encoding="utf-8").strip()
+                content = _read_context_file(mdc_file)
                 if content:
                     content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
                     cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"

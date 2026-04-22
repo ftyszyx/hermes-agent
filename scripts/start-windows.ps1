@@ -117,13 +117,15 @@ function Ensure-HermesHomeLayout {
 
     $soulPath = Join-Path $HomePath "SOUL.md"
     if (-not (Test-Path -LiteralPath $soulPath)) {
-        @"
+        $soulContent = @"
 # Hermes Agent Persona
 
 <!-- Edit this file to customize how Hermes communicates. -->
 
 You are Hermes, a helpful AI assistant.
-"@ | Set-Content -LiteralPath $soulPath -Encoding UTF8
+"@
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($soulPath, $soulContent, $utf8NoBom)
     }
 }
 
@@ -222,7 +224,16 @@ function Build-HermesCommandArgs {
             return $baseArgs + $ExtraArgs
         }
         "gateway" {
-            return $baseArgs + @("gateway", "run") + $ExtraArgs
+            if (-not $ExtraArgs -or $ExtraArgs.Count -eq 0) {
+                return $baseArgs + @("gateway", "run")
+            }
+
+            $firstArg = $ExtraArgs[0]
+            if (-not [string]::IsNullOrWhiteSpace($firstArg) -and $firstArg.StartsWith("-")) {
+                return $baseArgs + @("gateway", "run") + $ExtraArgs
+            }
+
+            return $baseArgs + @("gateway") + $ExtraArgs
         }
         "dashboard" {
             return $baseArgs + @("dashboard") + $ExtraArgs
