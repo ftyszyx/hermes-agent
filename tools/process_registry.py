@@ -254,10 +254,36 @@ class ProcessRegistry:
         """Best-effort liveness check for host-visible PIDs."""
         if not pid:
             return False
+        if _IS_WINDOWS:
+            try:
+                import ctypes
+
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                SYNCHRONIZE = 0x00100000
+                STILL_ACTIVE = 259
+
+                handle = ctypes.windll.kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                    False,
+                    int(pid),
+                )
+                if not handle:
+                    return False
+                try:
+                    exit_code = ctypes.c_ulong()
+                    if not ctypes.windll.kernel32.GetExitCodeProcess(
+                        handle, ctypes.byref(exit_code)
+                    ):
+                        return False
+                    return exit_code.value == STILL_ACTIVE
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                return False
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError, OSError):
             return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
@@ -344,8 +370,20 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                if _IS_WINDOWS:
+                    pty_argv = [
+                        user_shell,
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ]
+                else:
+                    pty_argv = [user_shell, "-lic", f"set +m; {command}"]
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
+                    pty_argv,
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -385,8 +423,20 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
+        if _IS_WINDOWS:
+            shell_argv = [
+                user_shell,
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ]
+        else:
+            shell_argv = [user_shell, "-lic", f"set +m; {command}"]
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            shell_argv,
             text=True,
             cwd=session.cwd,
             env=bg_env,

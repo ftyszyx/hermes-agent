@@ -1,6 +1,7 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
+import platform
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -434,9 +435,9 @@ class TestSkillDirectoryHeader:
         # The supporting-files block must emit both the relative form (so the
         # agent can call skill_view on it) and the absolute form (so it can
         # run the script directly via terminal).
-        assert "scripts/run.js" in msg
+        assert "scripts/run.js" in msg.replace("\\", "/")
         assert str(skill_dir / "scripts" / "run.js") in msg
-        assert f"node {skill_dir}/scripts/foo.js" in msg
+        assert str(skill_dir / "scripts" / "foo.js").replace("\\", "/") in msg.replace("\\", "/")
 
 
 class TestTemplateVarSubstitution:
@@ -550,6 +551,7 @@ class TestInlineShellExpansion:
 
     def test_inline_shell_runs_in_skill_directory(self, tmp_path):
         """Inline snippets get the skill dir as CWD so relative paths work."""
+        command = "Get-Location | Select-Object -ExpandProperty Path" if platform.system() == "Windows" else "pwd"
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch(
@@ -561,7 +563,7 @@ class TestInlineShellExpansion:
             skill_dir = _make_skill(
                 tmp_path,
                 "dyn-cwd",
-                body="Here: !`pwd`",
+                body=f"Here: !`{command}`",
             )
             scan_skill_commands()
             msg = build_skill_invocation_message("/dyn-cwd")
@@ -570,6 +572,7 @@ class TestInlineShellExpansion:
         assert f"Here: {skill_dir}" in msg
 
     def test_inline_shell_timeout_does_not_break_message(self, tmp_path):
+        command = "Start-Sleep -Seconds 5; Write-Output DYN_MARKER" if platform.system() == "Windows" else "sleep 5 && printf DYN_MARKER"
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch(
@@ -581,7 +584,7 @@ class TestInlineShellExpansion:
             _make_skill(
                 tmp_path,
                 "dyn-slow",
-                body="Slow: !`sleep 5 && printf DYN_MARKER`",
+                body=f"Slow: !`{command}`",
             )
             scan_skill_commands()
             msg = build_skill_invocation_message("/dyn-slow")
@@ -592,4 +595,15 @@ class TestInlineShellExpansion:
         assert "inline-shell timeout" in msg
         # The command's intended stdout never made it through — only the
         # timeout marker (which echoes the command text) survives.
-        assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
+        assert "DYN_MARKER" not in msg.replace(command, "")
+
+    def test_inline_shell_uses_powershell_on_windows(self):
+        from agent.skill_commands import _inline_shell_argv
+
+        with patch("agent.skill_commands.platform.system", return_value="Windows"), \
+             patch("agent.skill_commands.shutil.which", side_effect=lambda name: name if name == "powershell" else None):
+            argv = _inline_shell_argv("Write-Output hi")
+
+        assert argv[0] == "powershell"
+        assert "-Command" in argv
+        assert argv[-1] == "Write-Output hi"

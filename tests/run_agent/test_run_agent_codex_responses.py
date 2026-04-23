@@ -1,5 +1,6 @@
 import sys
 import types
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +68,27 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
         api_mode="codex_responses",
         base_url="https://api.githubcopilot.com",
         api_key="gh-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+    return agent
+
+
+def _build_explicit_codex_agent(monkeypatch, *, base_url="https://example.invalid/api", model="gpt-5.4"):
+    _patch_agent_bootstrap(monkeypatch)
+
+    agent = run_agent.AIAgent(
+        model=model,
+        provider="custom",
+        api_mode="codex_responses",
+        base_url=base_url,
+        api_key="custom-token",
         quiet_mode=True,
         max_iterations=4,
         skip_context_files=True,
@@ -483,6 +505,452 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_explicit_codex_stream_json_error_does_not_fallback(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    monkeypatch.setattr(agent, "_should_use_raw_codex_sse", lambda api_kwargs: False)
+
+    class _BrokenJsonResponsesStream:
+        def __enter__(self_inner):
+            return self_inner
+
+        def __exit__(self_inner, exc_type, exc, tb):
+            return False
+
+        def __iter__(self_inner):
+            raise json.JSONDecodeError("Expecting value", "", 0)
+            yield None
+
+        def get_final_response(self_inner):
+            raise AssertionError("get_final_response should not be reached")
+
+    create_calls = {"count": 0}
+
+    def _fake_create(**kwargs):
+        create_calls["count"] += 1
+        return _codex_message_response("should not fallback")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _BrokenJsonResponsesStream(),
+            create=_fake_create,
+        )
+    )
+
+    with pytest.raises(json.JSONDecodeError):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert create_calls["count"] == 0
+    assert getattr(agent, "_disable_streaming", False) is False
+
+
+def test_explicit_codex_stream_transport_error_does_not_fallback(monkeypatch):
+    import httpx
+
+    agent = _build_explicit_codex_agent(monkeypatch)
+    monkeypatch.setattr(agent, "_should_use_raw_codex_sse", lambda api_kwargs: False)
+    calls = {"stream": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=lambda **kwargs: _codex_message_response("should not fallback"),
+        )
+    )
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["stream"] == 2
+
+
+def test_explicit_codex_stream_missing_completed_event_does_not_fallback(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    monkeypatch.setattr(agent, "_should_use_raw_codex_sse", lambda api_kwargs: False)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(
+            final_error=RuntimeError("Didn't receive a `response.completed` event.")
+        )
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not fallback")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="response.completed"):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 2, "create": 0}
+
+
+def test_explicit_custom_codex_stream_prefers_raw_sse_transport(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    raw_response = _codex_message_response("raw sse ok")
+    raw_calls = []
+
+    def _fake_raw(api_kwargs, client=None, on_first_delta=None):
+        raw_calls.append(
+            {
+                "api_kwargs": api_kwargs,
+                "client": client,
+                "on_first_delta": on_first_delta,
+            }
+        )
+        return raw_response
+
+    monkeypatch.setattr(agent, "_run_codex_stream_raw_sse", _fake_raw)
+
+    sdk_client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("SDK stream should not be used for explicit custom raw SSE")
+            )
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs(), client=sdk_client)
+
+    assert response is raw_response
+    assert len(raw_calls) == 1
+    assert raw_calls[0]["client"] is sdk_client
+    assert raw_calls[0]["api_kwargs"]["model"] == "gpt-5-codex"
+
+
+def test_raw_codex_sse_parses_terminal_response_and_deltas(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    text_deltas = []
+    reasoning_deltas = []
+    agent.stream_delta_callback = text_deltas.append
+    agent.reasoning_callback = reasoning_deltas.append
+    agent._interrupt_requested = False
+
+    sse_lines = [
+        "event: response.created",
+        'data: {"type":"response.created"}',
+        "",
+        "event: response.reasoning_summary.delta",
+        'data: {"type":"response.reasoning_summary.delta","delta":"thinking"}',
+        "",
+        "event: response.output_text.delta",
+        'data: {"type":"response.output_text.delta","delta":"OK"}',
+        "",
+        "event: response.completed",
+        'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
+        "",
+    ]
+    captured = {}
+
+    class _FakeRawResponse:
+        def __init__(self, lines):
+            self.headers = {"Content-Type": "text/event-stream"}
+            self._lines = list(lines)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            return iter(self._lines)
+
+    class _FakeHttpxClient:
+        def __init__(self, *args, **kwargs):
+            captured["init_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, headers=None, json=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _FakeRawResponse(sse_lines)
+
+    monkeypatch.setattr("httpx.Client", _FakeHttpxClient)
+
+    response = agent._run_codex_stream_raw_sse(_codex_request_kwargs())
+
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://example.invalid/api/responses"
+    assert captured["headers"]["Accept"] == "text/event-stream"
+    assert captured["headers"]["Authorization"] == "Bearer custom-token"
+    assert captured["json"]["stream"] is True
+    assert text_deltas == ["OK"]
+    assert reasoning_deltas == ["thinking"]
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "OK"
+
+
+def test_responses_stream_transport_sdk_disables_raw_sse(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    agent._responses_stream_transport = "sdk"
+
+    assert agent._should_use_raw_codex_sse(_codex_request_kwargs()) is False
+
+
+def test_responses_stream_transport_raw_sse_forces_raw_path(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    agent._responses_stream_transport = "raw_sse"
+
+    assert agent._should_use_raw_codex_sse(_codex_request_kwargs()) is True
+
+
+def test_agent_reads_responses_stream_transport_from_config(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    import hermes_cli.config as config_mod
+
+    original_load_config = config_mod.load_config
+
+    def _fake_load_config():
+        cfg = original_load_config()
+        cfg["model"] = dict(cfg.get("model") or {})
+        cfg["model"]["responses_stream_transport"] = "sdk"
+        return cfg
+
+    monkeypatch.setattr(config_mod, "load_config", _fake_load_config)
+
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="https://example.invalid/api",
+        api_key="custom-token",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+
+    assert agent._responses_stream_transport == "sdk"
+
+
+def test_agent_prefers_matching_custom_provider_transport(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    import hermes_cli.config as config_mod
+
+    original_load_config = config_mod.load_config
+
+    def _fake_load_config():
+        cfg = original_load_config()
+        cfg["model"] = dict(cfg.get("model") or {})
+        cfg["model"]["responses_stream_transport"] = "sdk"
+        cfg["providers"] = {
+            "myproxy": {
+                "base_url": "https://example.invalid/api",
+                "model": "gpt-5.4",
+                "responses_stream_transport": "raw_sse",
+            }
+        }
+        return cfg
+
+    monkeypatch.setattr(config_mod, "load_config", _fake_load_config)
+
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="https://example.invalid/api",
+        api_key="custom-token",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+
+    assert agent._responses_stream_transport == "raw_sse"
+
+
+def test_run_conversation_explicit_codex_non_retryable_error_skips_provider_fallback(monkeypatch):
+    agent = _build_explicit_codex_agent(monkeypatch)
+    agent._fallback_chain = [{"provider": "openrouter", "model": "gpt-4o"}]
+    agent._fallback_index = 0
+
+    status_messages = []
+    monkeypatch.setattr(agent, "_emit_status", status_messages.append)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: (_ for _ in ()).throw(json.JSONDecodeError("Expecting value", "", 0)),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_try_activate_fallback",
+        lambda: (_ for _ in ()).throw(AssertionError("provider fallback should not be attempted")),
+    )
+
+    result = agent.run_conversation("Ping")
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert "Expecting value" in result["error"]
+    assert all("trying fallback" not in msg.lower() for msg in status_messages)
+
+
+def test_run_codex_stream_recovers_from_sdk_none_iterable_parser_bug(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    class _BrokenResponsesStream:
+        def __enter__(self_inner):
+            return self_inner
+
+        def __exit__(self_inner, exc_type, exc, tb):
+            return False
+
+        def __iter__(self_inner):
+            yield SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="sdk bug recovered")],
+                ),
+            )
+            raise TypeError("'NoneType' object is not iterable")
+
+        def get_final_response(self_inner):
+            raise AssertionError("get_final_response should not be called after iterator failure")
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _BrokenResponsesStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("should not fallback")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+    assert response.output[0].content[0].text == "sdk bug recovered"
+
+
+def test_run_codex_create_stream_fallback_recovers_from_sdk_none_iterable_parser_bug(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"create": 0}
+
+    class _BrokenCreateStream:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            yield SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="fallback sdk bug recovered")],
+                ),
+            )
+            raise TypeError("'NoneType' object is not iterable")
+
+        def close(self):
+            self.closed = True
+
+    broken_stream = _BrokenCreateStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return broken_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_create_stream_fallback(_codex_request_kwargs())
+
+    assert calls["create"] == 1
+    assert broken_stream.closed is True
+    assert response.output[0].content[0].text == "fallback sdk bug recovered"
+
+
+def test_run_codex_create_non_stream_preflights_without_instance_attr_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"create": 0}
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs["model"] == "gpt-5-codex"
+        assert kwargs["instructions"] == "You are Hermes."
+        assert kwargs["input"] == [{"role": "user", "content": "Ping"}]
+        assert kwargs["store"] is False
+        return _codex_message_response("non-stream ok")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_create_non_stream(_codex_request_kwargs())
+
+    assert calls["create"] == 1
+    assert response.output[0].content[0].text == "non-stream ok"
+
+
+def test_run_codex_create_non_stream_raises_business_error_for_200_wrapper(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    wrapped_error = SimpleNamespace(
+        to_dict=lambda: {"code": 400000, "code_msg": "Authorization验证错误"},
+        __pydantic_extra__={"code": 400000, "code_msg": "Authorization验证错误"},
+        output=None,
+        status=None,
+        model=None,
+        object=None,
+        error=None,
+    )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: wrapped_error,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Authorization验证错误"):
+        agent._run_codex_create_non_stream(_codex_request_kwargs())
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

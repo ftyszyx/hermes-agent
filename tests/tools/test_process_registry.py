@@ -340,6 +340,37 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
+    def test_spawn_local_uses_powershell_on_windows(self, registry):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry._IS_WINDOWS", True), \
+            patch("tools.process_registry._find_shell", return_value="powershell.exe"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local("Write-Output hello", cwd=r"C:\work")
+
+        assert captured["cmd"][:5] == [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+        ]
+        assert captured["cmd"][5] == "-Command"
+        assert captured["cmd"][6] == "Write-Output hello"
+
     def test_spawn_via_env_uses_backend_temp_dir_for_artifacts(self, registry):
         class FakeEnv:
             def __init__(self):
@@ -598,20 +629,21 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.pid_scope = "host"
         registry._running[s.id] = s
 
         calls = []
 
-        def fake_kill(pid, sig):
-            calls.append((pid, sig))
+        def fake_terminate(pid):
+            calls.append(pid)
 
         try:
-            with patch("tools.process_registry.os.kill", side_effect=fake_kill):
+            with patch.object(registry, "_is_host_pid_alive", return_value=True), \
+                 patch.object(registry, "_terminate_host_pid", side_effect=fake_terminate):
                 result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"
-            assert (424242, 0) in calls
-            assert (424242, signal.SIGTERM) in calls
+            assert 424242 in calls
         finally:
             registry._running.pop(s.id, None)
 

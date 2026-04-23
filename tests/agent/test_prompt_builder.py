@@ -27,6 +27,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
+    WINDOWS_POWERSHELL_HINT,
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
@@ -817,6 +818,10 @@ class TestEnvironmentHints:
         assert "/mnt/c/" in WSL_ENVIRONMENT_HINT
         assert "WSL" in WSL_ENVIRONMENT_HINT
 
+    def test_windows_hint_mentions_powershell(self):
+        assert "PowerShell" in WINDOWS_POWERSHELL_HINT
+        assert "Windows" in WINDOWS_POWERSHELL_HINT
+
     def test_build_environment_hints_on_wsl(self, monkeypatch):
         import agent.prompt_builder as _pb
         monkeypatch.setattr(_pb, "is_wsl", lambda: True)
@@ -824,9 +829,18 @@ class TestEnvironmentHints:
         assert "/mnt/" in result
         assert "WSL" in result
 
+    def test_build_environment_hints_on_windows(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setattr(_pb.platform, "system", lambda: "Windows")
+        result = _pb.build_environment_hints()
+        assert "PowerShell" in result
+        assert "Windows" in result
+
     def test_build_environment_hints_not_wsl(self, monkeypatch):
         import agent.prompt_builder as _pb
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setattr(_pb.platform, "system", lambda: "Linux")
         result = _pb.build_environment_hints()
         assert result == ""
 
@@ -1068,6 +1082,5 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
 

@@ -748,6 +748,7 @@ class AIAgent:
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
+        responses_stream_transport: str = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -794,6 +795,8 @@ class AIAgent:
             max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
             reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
                 If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
+            responses_stream_transport (str): Responses API streaming transport override:
+                "auto", "sdk", or "raw_sse". Applies to api_mode='codex_responses'.
             prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
                 Useful for injecting a few-shot example or priming the model's response style.
                 Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
@@ -837,6 +840,12 @@ class AIAgent:
         self.base_url = base_url or ""
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
         self.provider = provider_name or ""
+        self._responses_stream_transport_explicit = bool(
+            isinstance(responses_stream_transport, str) and responses_stream_transport.strip()
+        )
+        self._api_mode_explicit = api_mode in {
+            "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"
+        }
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
@@ -1564,6 +1573,16 @@ class AIAgent:
             _config_context_length = _model_cfg.get("context_length")
         else:
             _config_context_length = None
+        _responses_stream_transport = responses_stream_transport
+        if not isinstance(_responses_stream_transport, str) or not _responses_stream_transport.strip():
+            if isinstance(_model_cfg, dict):
+                _responses_stream_transport = _model_cfg.get("responses_stream_transport", "auto")
+            else:
+                _responses_stream_transport = "auto"
+        self._responses_stream_transport = self._normalize_responses_stream_transport(
+            _responses_stream_transport,
+            source="model.responses_stream_transport",
+        )
         if _config_context_length is not None:
             try:
                 _config_context_length = int(_config_context_length)
@@ -1599,6 +1618,16 @@ class AIAgent:
                     continue
                 _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
                 if _cp_url and _cp_url == self.base_url.rstrip("/"):
+                    _cp_transport = _cp_entry.get("responses_stream_transport")
+                    if (
+                        not self._responses_stream_transport_explicit
+                        and isinstance(_cp_transport, str)
+                        and _cp_transport.strip()
+                    ):
+                        self._responses_stream_transport = self._normalize_responses_stream_transport(
+                            _cp_transport,
+                            source=f"custom provider {(_cp_entry.get('name') or _cp_url)!r}",
+                        )
                     _cp_models = _cp_entry.get("models", {})
                     if isinstance(_cp_models, dict):
                         _cp_model_cfg = _cp_models.get(self.model, {})
@@ -1803,6 +1832,8 @@ class AIAgent:
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "api_mode_explicit": self._api_mode_explicit,
+            "responses_stream_transport": getattr(self, "_responses_stream_transport", "auto"),
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
@@ -1880,6 +1911,7 @@ class AIAgent:
         from hermes_cli.providers import determine_api_mode
 
         # ── Determine api_mode if not provided ──
+        _api_mode_explicit = bool(api_mode)
         if not api_mode:
             api_mode = determine_api_mode(new_provider, base_url)
 
@@ -1904,8 +1936,36 @@ class AIAgent:
         self.provider = new_provider
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
+        self._api_mode_explicit = _api_mode_explicit
+        self._responses_stream_transport = self._normalize_responses_stream_transport(
+            getattr(self, "_responses_stream_transport", "auto"),
+            source="runtime",
+        )
         if api_key:
             self.api_key = api_key
+        if not getattr(self, "_responses_stream_transport_explicit", False):
+            try:
+                from hermes_cli.config import (
+                    get_compatible_custom_providers,
+                    load_config as _load_agent_config,
+                )
+                _switch_cfg = _load_agent_config()
+                _switch_custom_providers = get_compatible_custom_providers(_switch_cfg)
+            except Exception:
+                _switch_custom_providers = []
+            for _cp_entry in _switch_custom_providers:
+                if not isinstance(_cp_entry, dict):
+                    continue
+                _cp_url = str(_cp_entry.get("base_url") or "").rstrip("/")
+                if not _cp_url or _cp_url != self.base_url.rstrip("/"):
+                    continue
+                _cp_transport = _cp_entry.get("responses_stream_transport")
+                if isinstance(_cp_transport, str) and _cp_transport.strip():
+                    self._responses_stream_transport = self._normalize_responses_stream_transport(
+                        _cp_transport,
+                        source=f"custom provider {(_cp_entry.get('name') or _cp_url)!r}",
+                    )
+                break
 
         # ── Build new client ──
         if api_mode == "anthropic_messages":
@@ -1984,6 +2044,8 @@ class AIAgent:
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "api_mode_explicit": self._api_mode_explicit,
+            "responses_stream_transport": getattr(self, "_responses_stream_transport", "auto"),
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
@@ -4324,6 +4386,31 @@ class AIAgent:
         """Split a stored tool id into (call_id, response_item_id)."""
         return _codex_split_responses_tool_id(raw_id)
 
+    @staticmethod
+    def _normalize_responses_stream_transport(
+        value: Any,
+        *,
+        source: str = "config.yaml",
+    ) -> str:
+        """Normalize Responses stream transport config to a supported value."""
+        normalized = str(value or "auto").strip().lower()
+        if normalized in {"auto", "sdk", "raw_sse"}:
+            return normalized
+        logger.warning(
+            "Invalid responses stream transport in %s: %r; falling back to 'auto'.",
+            source,
+            value,
+        )
+        return "auto"
+
+    @staticmethod
+    def _preflight_codex_api_kwargs(api_kwargs: Any, *, allow_stream: bool = False) -> dict:
+        """Validate/sanitize Responses API kwargs before a Codex request."""
+        return _codex_preflight_codex_api_kwargs(
+            api_kwargs,
+            allow_stream=allow_stream,
+        )
+
     def _derive_responses_function_call_id(
         self,
         call_id: str,
@@ -4696,9 +4783,110 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _codex_stream_fallbacks_allowed(self) -> bool:
+        """Whether Codex streaming transport may silently downgrade/fallback.
+
+        If the caller explicitly selected ``api_mode='codex_responses'``, honor
+        that contract strictly: transport/protocol problems should surface as
+        errors instead of silently downgrading to non-streaming create paths.
+        Auto-detected Responses mode keeps the existing defensive fallbacks.
+        """
+        return self._provider_fallbacks_allowed()
+
+    def _provider_fallbacks_allowed(self) -> bool:
+        """Whether provider-chain fallback may switch away from the backend.
+
+        Explicit ``api_mode='codex_responses'`` is treated as a strict
+        streaming contract. When the upstream `/responses` endpoint fails or
+        returns malformed data, surface that error directly instead of quietly
+        rerouting the turn through a fallback provider/model.
+        """
+        return not (
+            self.api_mode == "codex_responses"
+            and getattr(self, "_api_mode_explicit", False)
+        )
+
+    def _maybe_activate_provider_fallback(self, status_message: Optional[str] = None) -> bool:
+        """Emit a fallback status message and switch providers when allowed."""
+        if not self._provider_fallbacks_allowed():
+            return False
+        if status_message and self._fallback_index < len(self._fallback_chain):
+            self._emit_status(status_message)
+        return self._try_activate_fallback()
+
+    @staticmethod
+    def _is_responses_sdk_none_iterable_error(exc: Exception) -> bool:
+        """Return True for the known OpenAI Responses parser null-list crash.
+
+        Some OpenAI-compatible `/responses` providers return nullable list
+        fields such as `message.content: null` in `response.completed` events.
+        `openai-python` 2.32.0 assumes those fields are iterable during stream
+        finalization and raises `TypeError: 'NoneType' object is not iterable`.
+        Hermes can safely recover by bypassing SDK final parsing and using the
+        already streamed items/deltas or a non-stream fallback request.
+        """
+        text = str(exc or "")
+        return isinstance(exc, TypeError) and "NoneType" in text and "iterable" in text
+
+    @staticmethod
+    def _extract_codex_business_error(response: Any) -> Optional[str]:
+        """Detect non-OpenAI business-error payloads wrapped in HTTP 200.
+
+        Some custom `/responses` gateways return a JSON body like
+        ``{"code": 400000, "code_msg": "Authorization验证错误"}``
+        with HTTP 200 instead of an OpenAI-compatible error shape. The OpenAI
+        SDK coerces that into a `Response` object with all standard fields set
+        to ``None`` and the business fields stored as extras. Detect that here
+        so Hermes can surface the real provider error instead of stumbling into
+        misleading empty-output / None-iterable failures later.
+        """
+        if response is None:
+            return None
+
+        raw = None
+        try:
+            if hasattr(response, "to_dict"):
+                raw = response.to_dict()
+        except Exception:
+            raw = None
+
+        if not isinstance(raw, dict):
+            raw = getattr(response, "__pydantic_extra__", None)
+
+        if not isinstance(raw, dict):
+            return None
+
+        code = raw.get("code")
+        code_msg = raw.get("code_msg") or raw.get("message")
+        if code is None and not code_msg:
+            return None
+
+        # Don't misclassify genuine OpenAI-compatible payloads that happen to
+        # carry unrelated extras alongside a valid response object.
+        if any(raw.get(k) is not None for k in ("output", "status", "model", "object", "error")):
+            return None
+
+        parts = []
+        if code is not None:
+            parts.append(f"provider code {code}")
+        if isinstance(code_msg, str) and code_msg.strip():
+            parts.append(code_msg.strip())
+        return ": ".join(parts) if parts else "Provider returned a non-standard business error payload."
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
+
+        if self._should_use_raw_codex_sse(api_kwargs):
+            logger.info(
+                "Codex Responses stream using raw SSE transport. %s",
+                self._client_log_context(),
+            )
+            return self._run_codex_stream_raw_sse(
+                api_kwargs,
+                client=client,
+                on_first_delta=on_first_delta,
+            )
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
@@ -4784,10 +4972,45 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except TypeError as exc:
+                if not self._is_responses_sdk_none_iterable_error(exc):
+                    raise
+                self._disable_streaming = True
+                logger.warning(
+                    "Codex Responses stream finalization hit SDK null-list parser bug; "
+                    "recovering without get_final_response(). %s error=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                if collected_output_items:
+                    return SimpleNamespace(
+                        output=list(collected_output_items),
+                        status="completed",
+                        model=getattr(active_client, "model", None),
+                    )
+                if self._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(self._codex_streamed_text_parts)
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                        status="completed",
+                    )
+                logger.info(
+                    "Codex Responses stream parser bug had no recoverable streamed payload; "
+                    "falling back to non-streaming create(). %s",
+                    self._client_log_context(),
+                )
+                return self._run_codex_create_non_stream(api_kwargs, client=active_client)
             except json.JSONDecodeError as exc:
                 if self._has_stream_consumers() and (
                     self._codex_streamed_text_parts or has_tool_calls
                 ):
+                    raise
+                if not self._codex_stream_fallbacks_allowed():
                     raise
                 self._disable_streaming = True
                 logger.info(
@@ -4807,6 +5030,8 @@ class AIAgent:
                         exc,
                     )
                     continue
+                if not self._codex_stream_fallbacks_allowed():
+                    raise
                 logger.debug(
                     "Codex Responses stream transport failed; falling back to create(stream=True). %s error=%s",
                     self._client_log_context(),
@@ -4829,8 +5054,243 @@ class AIAgent:
                         "Responses stream did not emit response.completed; falling back to create(stream=True). %s",
                         self._client_log_context(),
                     )
+                    if not self._codex_stream_fallbacks_allowed():
+                        raise
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+
+    def _should_use_raw_codex_sse(self, api_kwargs: dict) -> bool:
+        """Return True when Codex streaming should bypass the OpenAI SDK parser."""
+        if self.api_mode != "codex_responses":
+            return False
+        transport = str(getattr(self, "_responses_stream_transport", "auto") or "auto").strip().lower()
+        if transport == "raw_sse":
+            return True
+        if transport == "sdk":
+            return False
+        if env_var_enabled("HERMES_CODEX_RAW_SSE"):
+            return True
+        if env_var_enabled("HERMES_CODEX_DISABLE_RAW_SSE", "0"):
+            return False
+        provider = str(getattr(self, "provider", "") or "").strip().lower()
+        if provider == "custom" and getattr(self, "_api_mode_explicit", False):
+            return True
+        return False
+
+    def _codex_raw_sse_headers(self, client: Any = None) -> dict:
+        """Build headers for raw Codex SSE requests from the current client state."""
+        headers: dict[str, str] = {}
+
+        default_headers = None
+        if client is not None:
+            default_headers = getattr(client, "default_headers", None)
+            if not default_headers:
+                default_headers = getattr(client, "_default_headers", None)
+        if not default_headers:
+            default_headers = getattr(self, "_client_kwargs", {}).get("default_headers")
+
+        if isinstance(default_headers, dict):
+            for key, value in default_headers.items():
+                if value is None:
+                    continue
+                headers[str(key)] = str(value)
+
+        api_key = str(getattr(self, "api_key", "") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "text/event-stream"
+        return headers
+
+    def _run_codex_stream_raw_sse(
+        self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None
+    ):
+        """Execute a raw SSE Codex stream and synthesize a Responses-style object."""
+        import httpx as _httpx
+
+        request_kwargs = self._preflight_codex_api_kwargs(
+            {**dict(api_kwargs), "stream": True},
+            allow_stream=True,
+        )
+        request_kwargs["stream"] = True
+        request_json = dict(request_kwargs)
+        request_json.pop("extra_headers", None)
+
+        headers = self._codex_raw_sse_headers(client=client)
+        extra_headers = request_kwargs.get("extra_headers")
+        if isinstance(extra_headers, dict):
+            for key, value in extra_headers.items():
+                if value is None:
+                    continue
+                headers[str(key)] = str(value)
+
+        base_url = str(getattr(self, "base_url", "") or "").rstrip("/")
+        endpoint = (
+            base_url
+            if base_url.lower().endswith("/responses")
+            else f"{base_url}/responses"
+        )
+        provider_timeout_cfg = get_provider_request_timeout(self.provider, self.model)
+        base_timeout = (
+            provider_timeout_cfg
+            if provider_timeout_cfg is not None
+            else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+        )
+        stream_read_timeout = (
+            provider_timeout_cfg
+            if provider_timeout_cfg is not None
+            else float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+        )
+        http_timeout = _httpx.Timeout(
+            connect=30.0,
+            read=stream_read_timeout,
+            write=base_timeout,
+            pool=30.0,
+        )
+
+        has_tool_calls = False
+        first_delta_fired = False
+        collected_output_items: list = []
+        last_terminal_response = None
+        self._codex_streamed_text_parts = []
+
+        def _fire_first_delta_once() -> None:
+            nonlocal first_delta_fired
+            if first_delta_fired:
+                return
+            first_delta_fired = True
+            if on_first_delta:
+                try:
+                    on_first_delta()
+                except Exception:
+                    pass
+
+        def _to_namespace(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return SimpleNamespace(**{k: _to_namespace(v) for k, v in obj.items()})
+            if isinstance(obj, list):
+                return [_to_namespace(v) for v in obj]
+            return obj
+
+        def _build_terminal_response(response_payload: Any = None):
+            payload = response_payload if isinstance(response_payload, dict) else {}
+            ns = _to_namespace(payload)
+            output = getattr(ns, "output", None)
+            if not isinstance(output, list):
+                output = []
+            if not output:
+                if collected_output_items:
+                    output = list(collected_output_items)
+                elif self._codex_streamed_text_parts and not has_tool_calls:
+                    output = [SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(
+                            type="output_text",
+                            text="".join(self._codex_streamed_text_parts),
+                        )],
+                    )]
+            setattr(ns, "output", output)
+            if not getattr(ns, "status", None):
+                setattr(ns, "status", "completed")
+            return ns
+
+        def _iter_sse_events(response: Any):
+            event_name = None
+            data_lines: list[str] = []
+            for raw_line in response.iter_lines():
+                if raw_line is None:
+                    continue
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
+                if line == "":
+                    if not data_lines:
+                        event_name = None
+                        continue
+                    data_str = "\n".join(data_lines)
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        payload = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        logger.debug(
+                            "Codex raw SSE received non-JSON frame event=%s data=%r. %s",
+                            event_name,
+                            data_str[:200],
+                            self._client_log_context(),
+                        )
+                        raise
+                    yield event_name or payload.get("type") or "message", payload
+                    event_name = None
+                    data_lines = []
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+                    continue
+
+        with _httpx.Client(timeout=http_timeout, proxy=_get_proxy_from_env()) as raw_client:
+            with raw_client.stream(
+                "POST",
+                endpoint,
+                headers=headers,
+                json=request_json,
+            ) as response:
+                self._capture_rate_limits(response)
+                response.raise_for_status()
+                for event_type, payload in _iter_sse_events(response):
+                    self._touch_activity("receiving stream response")
+                    if self._interrupt_requested:
+                        break
+
+                    if isinstance(payload, dict):
+                        payload_type = payload.get("type")
+                        if isinstance(payload_type, str) and payload_type:
+                            event_type = payload_type
+
+                    if event_type == "response.output_text.delta":
+                        delta_text = payload.get("delta", "") if isinstance(payload, dict) else ""
+                        if delta_text:
+                            self._codex_streamed_text_parts.append(delta_text)
+                            if not has_tool_calls:
+                                _fire_first_delta_once()
+                                self._fire_stream_delta(delta_text)
+                        continue
+
+                    if "reasoning" in event_type and "delta" in event_type:
+                        reasoning_text = payload.get("delta", "") if isinstance(payload, dict) else ""
+                        if reasoning_text:
+                            self._fire_reasoning_delta(reasoning_text)
+                        continue
+
+                    if event_type in {"response.output_item.added", "response.output_item.done"}:
+                        item_payload = payload.get("item") if isinstance(payload, dict) else None
+                        if isinstance(item_payload, dict):
+                            item_type = item_payload.get("type")
+                            if item_type in {"function_call", "custom_tool_call"}:
+                                has_tool_calls = True
+                            if event_type == "response.output_item.done":
+                                collected_output_items.append(_to_namespace(item_payload))
+                        continue
+
+                    if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                        response_payload = payload.get("response") if isinstance(payload, dict) else None
+                        last_terminal_response = _build_terminal_response(response_payload)
+                        if event_type == "response.failed":
+                            business_error = self._extract_codex_business_error(last_terminal_response)
+                            if business_error:
+                                raise RuntimeError(business_error)
+                        return last_terminal_response
+
+        if self._interrupt_requested:
+            raise InterruptedError("Agent interrupted during raw Codex SSE stream")
+        if last_terminal_response is not None:
+            return last_terminal_response
+        raise RuntimeError("Raw Codex SSE stream did not emit a terminal response.")
 
     def _run_codex_create_non_stream(self, api_kwargs: dict, client: Any = None):
         """Execute a non-streaming Responses API request for Codex-compatible models."""
@@ -4840,7 +5300,11 @@ class AIAgent:
         request_kwargs = self._preflight_codex_api_kwargs(
             dict(api_kwargs), allow_stream=False
         )
-        return active_client.responses.create(**request_kwargs)
+        response = active_client.responses.create(**request_kwargs)
+        business_error = self._extract_codex_business_error(response)
+        if business_error:
+            raise RuntimeError(business_error)
+        return response
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -4908,6 +5372,29 @@ class AIAgent:
                                 len(collected_text_deltas), len(assembled),
                             )
                     return terminal_response
+        except TypeError as exc:
+            if not self._is_responses_sdk_none_iterable_error(exc):
+                raise
+            self._disable_streaming = True
+            logger.warning(
+                "Codex create(stream=True) fallback hit SDK null-list parser bug; "
+                "recovering from streamed payload. %s error=%s",
+                self._client_log_context(),
+                exc,
+            )
+            if collected_output_items:
+                return SimpleNamespace(output=list(collected_output_items), status="completed")
+            if collected_text_deltas:
+                assembled = "".join(collected_text_deltas)
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message", role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    status="completed",
+                )
+            return self._run_codex_create_non_stream(api_kwargs, client=active_client)
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -5192,15 +5679,19 @@ class AIAgent:
         def _call():
             try:
                 if self.api_mode == "codex_responses":
-                    request_client_holder["client"] = self._create_request_openai_client(
-                        reason="codex_stream_request"
-                    )
                     if getattr(self, "_disable_streaming", False):
+                        request_client_holder["client"] = self._create_request_openai_client(
+                            reason="codex_stream_request"
+                        )
                         result["response"] = self._run_codex_create_non_stream(
                             api_kwargs,
                             client=request_client_holder["client"],
                         )
                     else:
+                        if not self._should_use_raw_codex_sse(api_kwargs):
+                            request_client_holder["client"] = self._create_request_openai_client(
+                                reason="codex_stream_request"
+                            )
                         result["response"] = self._run_codex_stream(
                             api_kwargs,
                             client=request_client_holder["client"],
@@ -6144,6 +6635,8 @@ class AIAgent:
         auth resolution and client construction — no duplicated provider→key
         mappings.
         """
+        if not self._provider_fallbacks_allowed():
+            return False
         if self._fallback_index >= len(self._fallback_chain):
             return False
 
@@ -6324,6 +6817,8 @@ class AIAgent:
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]           # setter updates _base_url_lower
             self.api_mode = rt["api_mode"]
+            self._api_mode_explicit = rt.get("api_mode_explicit", False)
+            self._responses_stream_transport = rt.get("responses_stream_transport", "auto")
             self.api_key = rt["api_key"]
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
@@ -6430,6 +6925,8 @@ class AIAgent:
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]
             self.api_mode = rt["api_mode"]
+            self._api_mode_explicit = rt.get("api_mode_explicit", False)
+            self._responses_stream_transport = rt.get("responses_stream_transport", "auto")
             self.api_key = rt["api_key"]
 
             if self.api_mode == "anthropic_messages":
@@ -9126,8 +9623,9 @@ class AIAgent:
                                 f"{self.log_prefix}⏳ {_nous_msg} Trying fallback...",
                                 force=True,
                             )
-                            self._emit_status(f"⏳ {_nous_msg}")
-                            if self._try_activate_fallback():
+                            if self._maybe_activate_provider_fallback(
+                                status_message=f"⏳ {_nous_msg}"
+                            ):
                                 retry_count = 0
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
@@ -9310,9 +9808,9 @@ class AIAgent:
                         # Eager fallback: empty/malformed responses are a common
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
-                        if self._fallback_index < len(self._fallback_chain):
-                            self._emit_status("⚠️ Empty/malformed response — switching to fallback...")
-                        if self._try_activate_fallback():
+                        if self._maybe_activate_provider_fallback(
+                            status_message="⚠️ Empty/malformed response — switching to fallback..."
+                        ):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -9381,8 +9879,12 @@ class AIAgent:
                         
                         if retry_count >= max_retries:
                             # Try fallback before giving up
-                            self._emit_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                            if self._try_activate_fallback():
+                            if self._maybe_activate_provider_fallback(
+                                status_message=(
+                                    f"⚠️ Max retries ({max_retries}) for invalid responses "
+                                    "— trying fallback..."
+                                )
+                            ):
                                 retry_count = 0
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
@@ -10220,8 +10722,9 @@ class AIAgent:
                         pool = self._credential_pool
                         pool_may_recover = pool is not None and pool.has_available()
                         if not pool_may_recover:
-                            self._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                            if self._try_activate_fallback():
+                            if self._maybe_activate_provider_fallback(
+                                status_message="⚠️ Rate limited — switching to fallback provider..."
+                            ):
                                 retry_count = 0
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
@@ -10477,8 +10980,12 @@ class AIAgent:
                     if is_client_error:
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
-                        self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._maybe_activate_provider_fallback(
+                            status_message=(
+                                f"⚠️ Non-retryable error (HTTP {status_code}) "
+                                "— trying fallback..."
+                            )
+                        ):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -10544,8 +11051,12 @@ class AIAgent:
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._maybe_activate_provider_fallback(
+                            status_message=(
+                                f"⚠️ Max retries ({max_retries}) exhausted "
+                                "— trying fallback..."
+                            )
+                        ):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -11404,11 +11915,12 @@ class AIAgent:
                                 self._empty_content_retries, self.model,
                                 self.provider,
                             )
-                            self._emit_status(
-                                "⚠️ Model returning empty responses — "
-                                "switching to fallback provider..."
-                            )
-                            if self._try_activate_fallback():
+                            if self._maybe_activate_provider_fallback(
+                                status_message=(
+                                    "⚠️ Model returning empty responses — "
+                                    "switching to fallback provider..."
+                                )
+                            ):
                                 self._empty_content_retries = 0
                                 self._emit_status(
                                     f"↻ Switched to fallback: {self.model} "

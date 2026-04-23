@@ -344,7 +344,14 @@ def _ensure_hermes_home_managed(home: Path):
 # =============================================================================
 
 DEFAULT_CONFIG = {
-    "model": "",
+    "model": {
+        "default": "",
+        # Responses API streaming transport:
+        # - auto: let Hermes choose the safest transport
+        # - sdk: use the provider SDK's stream parser
+        # - raw_sse: read text/event-stream frames directly
+        "responses_stream_transport": "auto",
+    },
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
@@ -1922,6 +1929,7 @@ def _normalize_custom_provider_entry(
         "apiKey": "api_key",
         "baseUrl": "base_url",
         "apiMode": "api_mode",
+        "responsesStreamTransport": "responses_stream_transport",
         "keyEnv": "key_env",
         "defaultModel": "default_model",
         "contextLength": "context_length",
@@ -1929,7 +1937,7 @@ def _normalize_custom_provider_entry(
     }
     _KNOWN_KEYS = {
         "name", "api", "url", "base_url", "api_key", "key_env",
-        "api_mode", "transport", "model", "default_model", "models",
+        "api_mode", "transport", "responses_stream_transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1996,6 +2004,10 @@ def _normalize_custom_provider_entry(
     api_mode = entry.get("api_mode") or entry.get("transport")
     if isinstance(api_mode, str) and api_mode.strip():
         normalized["api_mode"] = api_mode.strip()
+
+    responses_stream_transport = entry.get("responses_stream_transport")
+    if isinstance(responses_stream_transport, str) and responses_stream_transport.strip():
+        normalized["responses_stream_transport"] = responses_stream_transport.strip()
 
     model_name = entry.get("model") or entry.get("default_model")
     if isinstance(model_name, str) and model_name.strip():
@@ -2106,12 +2118,14 @@ _KNOWN_ROOT_KEYS = {
 
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
-    "name", "base_url", "api_key", "api_mode", "model", "models",
+    "name", "base_url", "api_key", "api_mode", "responses_stream_transport", "model", "models",
     "context_length", "rate_limit_delay",
 }
 
 # Fields that look like they should be inside custom_providers, not at root
-_CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
+_CUSTOM_PROVIDER_LIKE_FIELDS = {
+    "base_url", "api_key", "rate_limit_delay", "api_mode", "responses_stream_transport"
+}
 
 
 @dataclass
@@ -3082,6 +3096,76 @@ _COMMENTED_SECTIONS = """
 #   kimi-coding-cn (KIMI_CN_API_KEY)   — Kimi / Moonshot (China)
 #   minimax      (MINIMAX_API_KEY)     — MiniMax
 #   minimax-cn   (MINIMAX_CN_API_KEY)  — MiniMax (China)
+#
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
+#
+# fallback_model:
+#   provider: openrouter
+#   model: anthropic/claude-sonnet-4
+"""
+
+
+_SECURITY_COMMENT = """
+# --- Security -------------------------------------------------------------
+# API keys, tokens, and passwords are redacted from tool output by default.
+# Set to false to see full values (useful for debugging auth issues).
+# tirith pre-exec scanning is enabled by default when the tirith binary
+# is available. Configure via security.tirith_* keys or env vars
+# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+#
+# security:
+#   redact_secrets: false
+#   tirith_enabled: true
+#   tirith_path: "tirith"
+#   tirith_timeout: 5
+#   tirith_fail_open: true
+"""
+
+_FALLBACK_COMMENT = """
+# --- Fallback Model -------------------------------------------------------
+# Automatic provider failover when primary is unavailable.
+# Uncomment and configure to enable. Triggers on rate limits (429),
+# overload (529), service errors (503), or connection failures.
+#
+# Supported providers:
+#   openrouter      (OPENROUTER_API_KEY) - routes to any model
+#   openai-codex    (OAuth - hermes auth) - OpenAI Codex
+#   nous            (OAuth - hermes auth) - Nous Portal
+#   zai             (ZAI_API_KEY) - Z.AI / GLM
+#   kimi-coding     (KIMI_API_KEY) - Kimi / Moonshot
+#   kimi-coding-cn  (KIMI_CN_API_KEY) - Kimi / Moonshot (China)
+#   minimax         (MINIMAX_API_KEY) - MiniMax
+#   minimax-cn      (MINIMAX_CN_API_KEY) - MiniMax (China)
+#
+# For custom OpenAI-compatible endpoints, add base_url and key_env.
+#
+# fallback_model:
+#   provider: openrouter
+#   model: anthropic/claude-sonnet-4
+"""
+
+_COMMENTED_SECTIONS = """
+# --- Security -------------------------------------------------------------
+# API keys, tokens, and passwords are redacted from tool output by default.
+# Set to false to see full values (useful for debugging auth issues).
+#
+# security:
+#   redact_secrets: false
+
+# --- Fallback Model -------------------------------------------------------
+# Automatic provider failover when primary is unavailable.
+# Uncomment and configure to enable. Triggers on rate limits (429),
+# overload (529), service errors (503), or connection failures.
+#
+# Supported providers:
+#   openrouter      (OPENROUTER_API_KEY) - routes to any model
+#   openai-codex    (OAuth - hermes auth) - OpenAI Codex
+#   nous            (OAuth - hermes auth) - Nous Portal
+#   zai             (ZAI_API_KEY) - Z.AI / GLM
+#   kimi-coding     (KIMI_API_KEY) - Kimi / Moonshot
+#   kimi-coding-cn  (KIMI_CN_API_KEY) - Kimi / Moonshot (China)
+#   minimax         (MINIMAX_API_KEY) - MiniMax
+#   minimax-cn      (MINIMAX_CN_API_KEY) - MiniMax (China)
 #
 # For custom OpenAI-compatible endpoints, add base_url and key_env.
 #

@@ -253,6 +253,17 @@ class TestSaveConfigAtomicity:
             assert raw["model"] == "test/atomic-model"
             assert raw["agent"]["max_turns"] == 77
 
+    def test_saved_config_is_locale_decodable_on_windows(self, tmp_path):
+        """config.yaml should remain readable with the platform default codec."""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+            config["model"] = "test/windows-model"
+            save_config(config)
+
+            config_path = tmp_path / "config.yaml"
+            raw_text = config_path.read_text()
+            assert "test/windows-model" in raw_text
+
 
 class TestSanitizeEnvLines:
     """Tests for .env file corruption repair."""

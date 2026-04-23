@@ -199,6 +199,7 @@ _AUTH_PATTERNS = [
     "invalid api key",
     "invalid_api_key",
     "authentication",
+    "authorization",
     "unauthorized",
     "forbidden",
     "invalid token",

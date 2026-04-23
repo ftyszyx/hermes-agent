@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import platform
 import re
 import threading
 from collections import OrderedDict
@@ -425,6 +426,15 @@ WSL_ENVIRONMENT_HINT = (
     "the Windows username if needed."
 )
 
+WINDOWS_POWERSHELL_HINT = (
+    "You are running on native Windows. "
+    "Use PowerShell syntax for terminal commands, not bash syntax. "
+    "Prefer Windows paths like C:\\Users\\<username>\\... or quoted absolute paths "
+    "when invoking tools. Use $env:NAME to read environment variables in the shell. "
+    "Common command forms: `Get-ChildItem` instead of `ls`, `Get-Content` instead of `cat`, "
+    "`Select-String` instead of `grep`, and `Set-Location` instead of `cd` when you need explicit shell syntax."
+)
+
 
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
@@ -435,6 +445,8 @@ def build_environment_hints() -> str:
     hints: list[str] = []
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
+    elif platform.system() == "Windows":
+        hints.append(WINDOWS_POWERSHELL_HINT)
     return "\n\n".join(hints)
 
 

@@ -697,7 +697,9 @@ from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem usually persists between calls.
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands in the current runtime environment. Filesystem usually persists between calls.
+
+On Windows local sessions, commands run in PowerShell. On Unix-like sessions, commands run in bash-compatible shells. On Windows, prefer PowerShell cmdlets such as `Get-ChildItem`, `Get-Content`, `Select-String`, and `Set-Location`.
 
 Do NOT use cat/head/tail to read files — use read_file instead.
 Do NOT use grep/rg/find to search — use search_files instead.
@@ -1976,7 +1978,7 @@ TERMINAL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute on the VM"
+                "description": "The shell command to execute in the current runtime environment. Use PowerShell syntax on native Windows local sessions."
             },
             "background": {
                 "type": "boolean",

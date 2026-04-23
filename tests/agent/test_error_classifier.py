@@ -464,6 +464,11 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.auth
 
+    def test_message_authorization_pattern(self):
+        e = Exception("provider code 400000: Authorization验证错误")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.auth
+
     def test_message_model_not_found_pattern(self):
         e = Exception("gpt-99 is not a valid model")
         result = classify_api_error(e)

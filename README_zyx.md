@@ -344,6 +344,7 @@ model:
   base_url: https://gpt-proxy-usa-pub.singularity-ai.com/gpt-proxy/api
   api_key: <your key>
   api_mode: codex_responses
+  responses_stream_transport: raw_sse
 
 custom_providers:
   - name: kunlun-sky
@@ -351,4 +352,12 @@ custom_providers:
     api_key: <your key>
     model: gpt-5.4
     api_mode: codex_responses
+    responses_stream_transport: raw_sse
 ```
+
+## raw sse
+raw SSE 不是 Codex 独有协议，它就是标准的 text/event-stream 流式传输。区别只在于“怎么读这个流”：
+
+sdk：交给 OpenAI Python SDK 去解析流
+raw_sse：Hermes 自己直接按 SSE 帧读取和解析
+auto：Hermes 按规则自己选它就是标准的 text/event-stream 流式传输

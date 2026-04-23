@@ -7,7 +7,9 @@ can invoke skills via /skill-name commands and prompt-only built-ins like
 
 import json
 import logging
+import platform
 import re
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,14 @@ _INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
 
 # Cap inline-shell output so a runaway command can't blow out the context.
 _INLINE_SHELL_MAX_OUTPUT = 4000
+
+
+def _inline_shell_argv(command: str) -> list[str]:
+    """Return the shell argv used for inline skill snippets."""
+    if platform.system() == "Windows":
+        exe = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
+        return [exe, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]
+    return ["bash", "-c", command]
 
 
 def _load_skills_config() -> dict:
@@ -84,7 +94,7 @@ def _run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     """
     try:
         completed = subprocess.run(
-            ["bash", "-c", command],
+            _inline_shell_argv(command),
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
@@ -94,7 +104,8 @@ def _run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     except subprocess.TimeoutExpired:
         return f"[inline-shell timeout after {timeout}s: {command}]"
     except FileNotFoundError:
-        return f"[inline-shell error: bash not found]"
+        shell_name = "PowerShell" if platform.system() == "Windows" else "bash"
+        return f"[inline-shell error: {shell_name} not found]"
     except Exception as exc:
         return f"[inline-shell error: {exc}]"
 
