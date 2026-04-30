@@ -100,130 +100,6 @@ class TestSendMessageTool:
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
 
-    def test_cron_different_target_still_sends(self):
-        config, telegram_cfg = _make_config()
-
-        with patch.dict(
-            os.environ,
-            {
-                "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
-                "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
-            },
-            clear=False,
-        ), \
-             patch("gateway.config.load_gateway_config", return_value=config), \
-             patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            result = json.loads(
-                send_message_tool(
-                    {
-                        "action": "send",
-                        "target": "telegram:-1002",
-                        "message": "hello",
-                    }
-                )
-            )
-
-        assert result["success"] is True
-        assert result.get("skipped") is not True
-        send_mock.assert_awaited_once_with(
-            Platform.TELEGRAM,
-            telegram_cfg,
-            "-1002",
-            "hello",
-            thread_id=None,
-            media_files=[],
-        )
-        mirror_mock.assert_called_once_with(
-            "telegram",
-            "-1002",
-            "hello",
-            source_label="cli",
-            thread_id=None,
-        )
-
-    def test_cron_same_chat_different_thread_still_sends(self):
-        config, telegram_cfg = _make_config()
-
-        with patch.dict(
-            os.environ,
-            {
-                "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
-                "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
-                "HERMES_CRON_AUTO_DELIVER_THREAD_ID": "17585",
-            },
-            clear=False,
-        ), \
-             patch("gateway.config.load_gateway_config", return_value=config), \
-             patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            result = json.loads(
-                send_message_tool(
-                    {
-                        "action": "send",
-                        "target": "telegram:-1001:99999",
-                        "message": "hello",
-                    }
-                )
-            )
-
-        assert result["success"] is True
-        assert result.get("skipped") is not True
-        send_mock.assert_awaited_once_with(
-            Platform.TELEGRAM,
-            telegram_cfg,
-            "-1001",
-            "hello",
-            thread_id="99999",
-            media_files=[],
-        )
-        mirror_mock.assert_called_once_with(
-            "telegram",
-            "-1001",
-            "hello",
-            source_label="cli",
-            thread_id="99999",
-        )
-
-    def test_sends_to_explicit_telegram_topic_target(self):
-        config, telegram_cfg = _make_config()
-
-        with patch("gateway.config.load_gateway_config", return_value=config), \
-             patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
-            result = json.loads(
-                send_message_tool(
-                    {
-                        "action": "send",
-                        "target": "telegram:-1001:17585",
-                        "message": "hello",
-                    }
-                )
-            )
-
-        assert result["success"] is True
-        send_mock.assert_awaited_once_with(
-            Platform.TELEGRAM,
-            telegram_cfg,
-            "-1001",
-            "hello",
-            thread_id="17585",
-            media_files=[],
-        )
-        mirror_mock.assert_called_once_with(
-            "telegram",
-            "-1001",
-            "hello",
-            source_label="cli",
-            thread_id="17585",
-        )
-
     def test_resolved_telegram_topic_name_preserves_thread_id(self):
         config, telegram_cfg = _make_config()
 
@@ -291,39 +167,37 @@ class TestSendMessageTool:
             media_files=[],
         )
 
-    def test_media_only_message_uses_placeholder_for_mirroring(self):
-        config, telegram_cfg = _make_config()
+    def test_mirror_receives_current_session_user_id(self):
+        config, _telegram_cfg = _make_config()
 
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_PLATFORM": "telegram",
+                "HERMES_SESSION_USER_ID": "user-123",
+            }.get(name, default)
             result = json.loads(
                 send_message_tool(
                     {
                         "action": "send",
-                        "target": "telegram:-1001",
-                        "message": "MEDIA:/tmp/example.ogg",
+                        "target": "telegram:12345",
+                        "message": "hello",
                     }
                 )
             )
 
         assert result["success"] is True
-        send_mock.assert_awaited_once_with(
-            Platform.TELEGRAM,
-            telegram_cfg,
-            "-1001",
-            "",
-            thread_id=None,
-            media_files=[("/tmp/example.ogg", False)],
-        )
         mirror_mock.assert_called_once_with(
             "telegram",
-            "-1001",
-            "[Sent audio attachment]",
-            source_label="cli",
+            "12345",
+            "hello",
+            source_label="telegram",
             thread_id=None,
+            user_id="user-123",
         )
 
     def test_top_level_send_failure_redacts_query_token(self):
@@ -614,9 +488,9 @@ class TestSendToPlatformChunking:
         assert all(call == [] for call in sent_calls[:-1])
         assert sent_calls[-1] == media
 
-    def test_matrix_media_uses_native_adapter_helper(self, tmp_path):
+    def test_matrix_media_uses_native_adapter_helper(self):
 
-        doc_path = tmp_path / "test-send-message-matrix.pdf"
+        doc_path = Path("/tmp/test-send-message-matrix.pdf")
         doc_path.write_bytes(b"%PDF-1.4 test")
 
         try:
@@ -640,74 +514,6 @@ class TestSendToPlatformChunking:
             assert call.kwargs["media_files"] == [(str(doc_path), False)]
         finally:
             doc_path.unlink(missing_ok=True)
-
-    def test_feishu_media_uses_native_adapter_helper(self):
-
-        media = [("/tmp/test-send-message-feishu.png", False)]
-        helper = AsyncMock(
-            return_value={
-                "success": True,
-                "platform": "feishu",
-                "chat_id": "oc_123",
-                "message_id": "om_123",
-            }
-        )
-        with patch("tools.send_message_tool._send_feishu", helper):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.FEISHU,
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "oc_123",
-                    "here you go",
-                    media_files=media,
-                    thread_id="om_thread",
-                )
-            )
-
-        assert result["success"] is True
-        helper.assert_awaited_once()
-        call = helper.await_args
-        assert call.args[1] == "oc_123"
-        assert call.args[2] == "here you go"
-        assert call.kwargs["media_files"] == media
-        assert call.kwargs["thread_id"] == "om_thread"
-
-    def test_feishu_media_attaches_to_last_chunk(self):
-        sent_calls = []
-
-        async def fake_send(pconfig, chat_id, message, media_files=None, thread_id=None):
-            sent_calls.append(
-                {
-                    "message": message,
-                    "media_files": media_files or [],
-                    "thread_id": thread_id,
-                }
-            )
-            return {
-                "success": True,
-                "platform": "feishu",
-                "chat_id": chat_id,
-                "message_id": str(len(sent_calls)),
-            }
-
-        long_msg = "word " * 5000
-        media = [("/tmp/photo.png", False)]
-        with patch("tools.send_message_tool._send_feishu", fake_send):
-            asyncio.run(
-                _send_to_platform(
-                    Platform.FEISHU,
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
-                    "oc_123",
-                    long_msg,
-                    media_files=media,
-                    thread_id="om_thread",
-                )
-            )
-
-        assert len(sent_calls) >= 2
-        assert all(call["media_files"] == [] for call in sent_calls[:-1])
-        assert sent_calls[-1]["media_files"] == media
-        assert all(call["thread_id"] == "om_thread" for call in sent_calls)
 
     def test_matrix_text_only_uses_lightweight_path(self):
         """Text-only Matrix sends should NOT go through the heavy adapter path."""
@@ -1035,6 +841,44 @@ class TestParseTargetRefE164:
         assert _parse_target_ref("telegram", "+15551234567")[2] is False
         assert _parse_target_ref("discord", "+15551234567")[2] is False
         assert _parse_target_ref("matrix", "+15551234567")[2] is False
+
+
+class TestParseTargetRefSlack:
+    """_parse_target_ref recognizes Slack channel/user IDs as explicit."""
+
+    def test_public_channel_id_is_explicit(self):
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "C0B0QV5434G")
+        assert chat_id == "C0B0QV5434G"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_private_channel_id_is_explicit(self):
+        assert _parse_target_ref("slack", "G123ABCDEF")[2] is True
+
+    def test_dm_id_is_explicit(self):
+        assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
+
+    def test_user_id_is_not_explicit(self):
+        """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
+        targets. chat.postMessage rejects them — a DM must be opened first via
+        conversations.open to obtain a D... conversation ID.
+        """
+        assert _parse_target_ref("slack", "U123ABCDEF")[2] is False
+        assert _parse_target_ref("slack", "W123ABCDEF")[2] is False
+
+    def test_whitespace_is_stripped(self):
+        chat_id, _, is_explicit = _parse_target_ref("slack", "  C0B0QV5434G  ")
+        assert chat_id == "C0B0QV5434G"
+        assert is_explicit is True
+
+    def test_lowercase_or_short_id_is_not_explicit(self):
+        assert _parse_target_ref("slack", "c0b0qv5434g")[2] is False
+        assert _parse_target_ref("slack", "C123")[2] is False
+        assert _parse_target_ref("slack", "X0B0QV5434G")[2] is False
+
+    def test_slack_id_not_explicit_for_other_platforms(self):
+        assert _parse_target_ref("discord", "C0B0QV5434G")[2] is False
+        assert _parse_target_ref("telegram", "C0B0QV5434G")[2] is False
 
 
 class TestSendDiscordThreadId:

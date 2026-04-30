@@ -1026,17 +1026,33 @@ def check_fal_api_key() -> bool:
 
 
 def check_image_generation_requirements() -> bool:
-    """True if the configured image backend has its required credentials."""
+    """True if the configured image generation backend is available."""
     if _resolve_image_backend() == "openai_compatible":
         return _openai_compatible_key_is_configured()
 
     try:
-        if not check_fal_api_key():
-            return False
-        fal_client  # noqa: F401 — SDK presence check
-        return True
+        if check_fal_api_key():
+            fal_client  # noqa: F401 — SDK presence check
+            return True
     except ImportError:
-        return False
+        pass
+
+    # Probe plugin providers. Discovery is idempotent and cheap.
+    try:
+        from agent.image_gen_registry import list_providers
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        for provider in list_providers():
+            try:
+                if provider.is_available():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1082,11 +1098,11 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts using the user's "
-        "configured image backend. The underlying backend/model is "
-        "user-configured and is not selectable by the agent. Returns a "
-        "single image URL or local image path. Display it using markdown: "
-        "![description](URL_OR_PATH)"
+        "Generate high-quality images from text prompts. The underlying "
+        "backend (FAL, OpenAI, etc.) and model are user-configured and not "
+        "selectable by the agent. Returns either a URL or an absolute file "
+        "path in the `image` field; display it with markdown "
+        "![description](url-or-path) and the gateway will deliver it."
     ),
     "parameters": {
         "type": "object",
@@ -1107,13 +1123,114 @@ IMAGE_GENERATE_SCHEMA = {
 }
 
 
+def _read_configured_image_provider():
+    """Return the value of ``image_gen.provider`` from config.yaml, or None.
+
+    We only consult the plugin registry when this is explicitly set — an
+    unset value keeps users on the legacy in-tree FAL path even when other
+    providers happen to be registered (e.g. a user has OPENAI_API_KEY set
+    for other features but never asked for OpenAI image gen).
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            value = section.get("provider")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    except Exception as exc:
+        logger.debug("Could not read image_gen.provider: %s", exc)
+    return None
+
+
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+    """Route the call to a plugin-registered provider when one is selected.
+
+    Returns a JSON string on dispatch, or ``None`` to fall through to the
+    built-in FAL path.
+
+    Dispatch only fires when ``image_gen.provider`` is explicitly set AND
+    it does not point to ``fal`` (FAL still lives in-tree in this PR;
+    a later PR ports it into ``plugins/image_gen/fal/``). Any other value
+    that matches a registered plugin provider wins.
+    """
+    configured = _read_configured_image_provider()
+    if not configured or configured == "fal":
+        return None
+
+    try:
+        # Import locally so plugin discovery isn't triggered just by
+        # importing this module (tests rely on that).
+        from agent.image_gen_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        provider = get_provider(configured)
+    except Exception as exc:
+        logger.debug("image_gen plugin dispatch skipped: %s", exc)
+        return None
+
+    if provider is None:
+        try:
+            # Long-lived sessions may have discovered plugins before a bundled
+            # backend was patched in or before config changed. Retry once with
+            # a forced refresh before surfacing a missing-provider error.
+            _ensure_plugins_discovered(force=True)
+            provider = get_provider(configured)
+        except Exception as exc:
+            logger.debug("image_gen plugin force-refresh skipped: %s", exc)
+
+    if provider is None:
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": (
+                f"image_gen.provider='{configured}' is set but no plugin "
+                f"registered that name. Run `hermes plugins list` to see "
+                f"available image gen backends."
+            ),
+            "error_type": "provider_not_registered",
+        })
+
+    try:
+        result = provider.generate(prompt=prompt, aspect_ratio=aspect_ratio)
+    except Exception as exc:
+        logger.warning(
+            "Image gen provider '%s' raised: %s",
+            getattr(provider, "name", "?"), exc,
+        )
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": f"Provider '{getattr(provider, 'name', '?')}' error: {exc}",
+            "error_type": "provider_exception",
+        })
+    if not isinstance(result, dict):
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": "Provider returned a non-dict result",
+            "error_type": "provider_contract",
+        })
+    return json.dumps(result)
+
+
 def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
     if not prompt:
         return tool_error("prompt is required for image generation")
+    aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+
+    # Route to a plugin-registered provider if one is active (and it's
+    # not the in-tree FAL path).
+    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    if dispatched is not None:
+        return dispatched
+
     return image_generate_tool(
         prompt=prompt,
-        aspect_ratio=args.get("aspect_ratio", DEFAULT_ASPECT_RATIO),
+        aspect_ratio=aspect_ratio,
     )
 
 

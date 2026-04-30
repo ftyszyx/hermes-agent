@@ -1,14 +1,11 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
-import platform
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
-    build_plan_path,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
     resolve_skill_command_key,
@@ -37,6 +34,18 @@ description: Description for {name}.
 """
     (skill_dir / "SKILL.md").write_text(content)
     return skill_dir
+
+
+def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Path:
+    """Create a category symlink under skills_dir pointing outside the tree."""
+    external_category = linked_root / category
+    external_category.mkdir(parents=True, exist_ok=True)
+    symlink_path = skills_dir / category
+    try:
+        symlink_path.symlink_to(external_category, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
+    return external_category
 
 
 class TestScanSkillCommands:
@@ -101,6 +110,20 @@ class TestScanSkillCommands:
             result = scan_skill_commands()
         assert "/enabled-skill" in result
         assert "/disabled-skill" not in result
+
+    def test_finds_skills_in_symlinked_category_dir(self, tmp_path):
+        external_root = tmp_path / "repo"
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+
+        external_category = _symlink_category(skills_root, external_root, "linked")
+        _make_skill(external_category.parent, "knowledge-brain", category="linked")
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+            result = scan_skill_commands()
+
+        assert "/knowledge-brain" in result
+        assert result["/knowledge-brain"]["name"] == "knowledge-brain"
 
 
     def test_special_chars_stripped_from_cmd_key(self, tmp_path):
@@ -374,40 +397,6 @@ Generate some audio.
         assert 'file_path="<path>"' in msg
 
 
-class TestPlanSkillHelpers:
-    def test_build_plan_path_uses_workspace_relative_dir_and_slugifies_request(self):
-        path = build_plan_path(
-            "Implement OAuth login + refresh tokens!",
-            now=datetime(2026, 3, 15, 9, 30, 45),
-        )
-
-        assert path == Path(".hermes") / "plans" / "2026-03-15_093045-implement-oauth-login-refresh-tokens.md"
-
-    def test_plan_skill_message_can_include_runtime_save_path_note(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(
-                tmp_path,
-                "plan",
-                body="Save plans under .hermes/plans in the active workspace and do not execute the work.",
-            )
-            scan_skill_commands()
-            msg = build_skill_invocation_message(
-                "/plan",
-                "Add a /plan command",
-                runtime_note=(
-                    "Save the markdown plan with write_file to this exact relative path inside "
-                    "the active workspace/backend cwd: .hermes/plans/plan.md"
-                ),
-            )
-
-        assert msg is not None
-        assert "Save plans under $HERMES_HOME/plans" not in msg
-        assert ".hermes/plans" in msg
-        assert "Add a /plan command" in msg
-        assert ".hermes/plans/plan.md" in msg
-        assert "Runtime note:" in msg
-
-
 class TestSkillDirectoryHeader:
     """The activation message must expose the absolute skill directory and
     explain how to resolve relative paths, so skills with bundled scripts
@@ -435,9 +424,9 @@ class TestSkillDirectoryHeader:
         # The supporting-files block must emit both the relative form (so the
         # agent can call skill_view on it) and the absolute form (so it can
         # run the script directly via terminal).
-        assert "scripts/run.js" in msg.replace("\\", "/")
+        assert "scripts/run.js" in msg
         assert str(skill_dir / "scripts" / "run.js") in msg
-        assert str(skill_dir / "scripts" / "foo.js").replace("\\", "/") in msg.replace("\\", "/")
+        assert f"node {skill_dir}/scripts/foo.js" in msg
 
 
 class TestTemplateVarSubstitution:
@@ -551,7 +540,6 @@ class TestInlineShellExpansion:
 
     def test_inline_shell_runs_in_skill_directory(self, tmp_path):
         """Inline snippets get the skill dir as CWD so relative paths work."""
-        command = "Get-Location | Select-Object -ExpandProperty Path" if platform.system() == "Windows" else "pwd"
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch(
@@ -563,7 +551,7 @@ class TestInlineShellExpansion:
             skill_dir = _make_skill(
                 tmp_path,
                 "dyn-cwd",
-                body=f"Here: !`{command}`",
+                body="Here: !`pwd`",
             )
             scan_skill_commands()
             msg = build_skill_invocation_message("/dyn-cwd")
@@ -572,7 +560,6 @@ class TestInlineShellExpansion:
         assert f"Here: {skill_dir}" in msg
 
     def test_inline_shell_timeout_does_not_break_message(self, tmp_path):
-        command = "Start-Sleep -Seconds 5; Write-Output DYN_MARKER" if platform.system() == "Windows" else "sleep 5 && printf DYN_MARKER"
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch(
@@ -584,7 +571,7 @@ class TestInlineShellExpansion:
             _make_skill(
                 tmp_path,
                 "dyn-slow",
-                body=f"Slow: !`{command}`",
+                body="Slow: !`sleep 5 && printf DYN_MARKER`",
             )
             scan_skill_commands()
             msg = build_skill_invocation_message("/dyn-slow")
@@ -595,15 +582,4 @@ class TestInlineShellExpansion:
         assert "inline-shell timeout" in msg
         # The command's intended stdout never made it through — only the
         # timeout marker (which echoes the command text) survives.
-        assert "DYN_MARKER" not in msg.replace(command, "")
-
-    def test_inline_shell_uses_powershell_on_windows(self):
-        from agent.skill_commands import _inline_shell_argv
-
-        with patch("agent.skill_commands.platform.system", return_value="Windows"), \
-             patch("agent.skill_commands.shutil.which", side_effect=lambda name: name if name == "powershell" else None):
-            argv = _inline_shell_argv("Write-Output hi")
-
-        assert argv[0] == "powershell"
-        assert "-Command" in argv
-        assert argv[-1] == "Write-Output hi"
+        assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
