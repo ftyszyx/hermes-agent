@@ -524,6 +524,7 @@ class TestImagegenBackendRegistry:
     def test_fal_backend_registered(self):
         from hermes_cli.tools_config import IMAGEGEN_BACKENDS
         assert "fal" in IMAGEGEN_BACKENDS
+        assert "openai_compatible" in IMAGEGEN_BACKENDS
 
     def test_fal_catalog_loads_lazily(self):
         """catalog_fn should defer import to avoid import cycles."""
@@ -533,15 +534,14 @@ class TestImagegenBackendRegistry:
         assert "fal-ai/flux-2/klein/9b" in catalog
         assert "fal-ai/flux-2-pro" in catalog
 
-    def test_image_gen_providers_tagged_with_fal_backend(self):
-        """Both Nous Subscription and FAL.ai providers must carry the
-        imagegen_backend tag so _configure_provider fires the picker."""
+    def test_image_gen_providers_tagged_with_backends(self):
+        """Image generation providers carry backend tags so _configure_provider fires the picker."""
         from hermes_cli.tools_config import TOOL_CATEGORIES
         providers = TOOL_CATEGORIES["image_gen"]["providers"]
-        for p in providers:
-            assert p.get("imagegen_backend") == "fal", (
-                f"{p['name']} missing imagegen_backend tag"
-            )
+        backends = {p["name"]: p.get("imagegen_backend") for p in providers}
+        assert backends["Nous Subscription"] == "fal"
+        assert backends["FAL.ai"] == "fal"
+        assert backends["OpenAI-compatible"] == "openai_compatible"
 
 
 class TestImagegenModelPicker:
@@ -557,6 +557,20 @@ class TestImagegenModelPicker:
         # ordered[0] == current (default klein), ordered[1] == first non-default
         assert config["image_gen"]["model"] != "fal-ai/flux-2/klein/9b"
         assert config["image_gen"]["model"].startswith("fal-ai/")
+        assert config["image_gen"]["backend"] == "fal"
+
+    def test_openai_compatible_picker_writes_base_url_and_model(self):
+        from hermes_cli.tools_config import _configure_imagegen_model
+        config = {}
+        with patch("hermes_cli.tools_config._prompt_choice", return_value=0), \
+             patch("hermes_cli.tools_config._prompt",
+                   side_effect=["gpt-image-2", "https://sub2api.1postpro.com/v1"]):
+            _configure_imagegen_model("openai_compatible", config)
+
+        assert config["image_gen"]["backend"] == "openai_compatible"
+        assert config["image_gen"]["model"] == "gpt-image-2"
+        assert config["image_gen"]["base_url"] == "https://sub2api.1postpro.com/v1"
+        assert config["image_gen"]["response_format"] == "b64_json"
 
     def test_picker_with_gpt_image_does_not_prompt_quality(self):
         """GPT-Image quality is pinned to medium in the tool's defaults —

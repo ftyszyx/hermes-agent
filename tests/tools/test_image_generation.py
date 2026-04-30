@@ -9,6 +9,8 @@ tests/tools/test_managed_media_gateways.py.
 
 from __future__ import annotations
 
+import base64
+import json
 from unittest.mock import patch
 
 import pytest
@@ -336,6 +338,97 @@ class TestModelResolution:
                    return_value={"image_gen": {"model": "fal-ai/nano-banana-pro"}}):
             mid, _ = image_tool._resolve_fal_model()
         assert mid == "fal-ai/nano-banana-pro"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible backend
+# ---------------------------------------------------------------------------
+
+class TestOpenAICompatibleBackend:
+
+    def test_backend_defaults_to_fal(self, image_tool):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert image_tool._resolve_image_backend() == "fal"
+
+    def test_base_url_implies_openai_compatible_backend(self, image_tool):
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {"base_url": "https://example.com/v1"}}):
+            assert image_tool._resolve_image_backend() == "openai_compatible"
+
+    def test_builds_minimal_openai_compatible_payload(self, image_tool):
+        payload = image_tool._build_openai_compatible_payload(
+            "a cute orange cat astronaut",
+            "square",
+            model="gpt-image-2",
+            response_format="b64_json",
+        )
+        assert payload == {
+            "model": "gpt-image-2",
+            "prompt": "a cute orange cat astronaut",
+            "response_format": "b64_json",
+        }
+
+    def test_openai_compatible_extra_body_can_add_size(self, image_tool):
+        payload = image_tool._build_openai_compatible_payload(
+            "hello",
+            "portrait",
+            model="gpt-image-2",
+            extra_body={"size": "1024x1536", "quality": "medium"},
+        )
+        assert payload["size"] == "1024x1536"
+        assert payload["quality"] == "medium"
+
+    def test_extracts_url_response(self, image_tool):
+        extracted = image_tool._extract_openai_compatible_image({
+            "data": [{"url": "https://cdn.example.com/image.png"}],
+        })
+        assert extracted == {"url": "https://cdn.example.com/image.png", "path": None}
+
+    def test_extracts_b64_response_to_local_file(self, image_tool, tmp_path):
+        raw = b"fake-png-bytes"
+        b64 = base64.b64encode(raw).decode("ascii")
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {"output_dir": str(tmp_path)}}):
+            extracted = image_tool._extract_openai_compatible_image({
+                "data": [{"b64_json": b64}],
+            })
+        assert extracted["url"] == extracted["path"]
+        path = extracted["path"]
+        assert path is not None
+        assert path.endswith(".png")
+        assert open(path, "rb").read() == raw
+
+    def test_image_generate_dispatches_to_openai_compatible(self, image_tool):
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {"backend": "openai_compatible", "model": "gpt-image-2"}}), \
+             patch.object(image_tool, "_generate_openai_compatible_image",
+                          return_value={
+                              "model": "gpt-image-2",
+                              "image": "https://cdn.example.com/image.png",
+                              "image_path": None,
+                          }) as generate:
+            response = json.loads(image_tool.image_generate_tool("orange cat", "square"))
+
+        assert response["success"] is True
+        assert response["image"] == "https://cdn.example.com/image.png"
+        assert "media" not in response
+        generate.assert_called_once_with("orange cat", "square", num_images=None, seed=None)
+
+    def test_image_generate_returns_media_tag_for_local_b64_output(self, image_tool):
+        path = "E:\\tmp\\generated.png"
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {"backend": "openai_compatible", "model": "gpt-image-2"}}), \
+             patch.object(image_tool, "_generate_openai_compatible_image",
+                          return_value={
+                              "model": "gpt-image-2",
+                              "image": path,
+                              "image_path": path,
+                          }):
+            response = json.loads(image_tool.image_generate_tool("orange cat", "square"))
+
+        assert response["success"] is True
+        assert response["image_path"] == path
+        assert response["media"] == f"MEDIA:{path}"
 
 
 # ---------------------------------------------------------------------------

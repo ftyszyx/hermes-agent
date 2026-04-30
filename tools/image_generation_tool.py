@@ -20,16 +20,19 @@ Pricing shown in UI strings is as-of the initial commit; we accept drift and
 update when it's noticed.
 """
 
+import base64
 import json
 import logging
 import os
 import datetime
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlencode
 
 import fal_client
+import httpx
 
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -291,6 +294,13 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
 
 # Default model is the fastest reasonable option. Kept cheap and sub-1s.
 DEFAULT_MODEL = "fal-ai/flux-2/klein/9b"
+DEFAULT_OPENAI_COMPATIBLE_MODEL = "gpt-image-2"
+DEFAULT_OPENAI_COMPATIBLE_RESPONSE_FORMAT = "b64_json"
+OPENAI_COMPATIBLE_SIZES = {
+    "landscape": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+}
 
 DEFAULT_ASPECT_RATIO = "landscape"
 VALID_ASPECT_RATIOS = ("landscape", "square", "portrait")
@@ -314,6 +324,81 @@ _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
 _managed_fal_client = None
 _managed_fal_client_config = None
 _managed_fal_client_lock = threading.Lock()
+
+
+def _load_image_gen_config() -> Dict[str, Any]:
+    """Return the image_gen config section, tolerating malformed user YAML."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        img_cfg = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        if isinstance(img_cfg, dict):
+            return img_cfg
+    except Exception as exc:
+        logger.debug("Could not load image_gen config: %s", exc)
+    return {}
+
+
+def _resolve_image_backend() -> str:
+    """Resolve the configured image generation backend."""
+    img_cfg = _load_image_gen_config()
+    raw = str(img_cfg.get("backend") or "").strip().lower().replace("-", "_")
+    if not raw and img_cfg.get("base_url"):
+        raw = "openai_compatible"
+    if raw in {"openai", "openai_compatible", "openai_compat"}:
+        return "openai_compatible"
+    return "fal"
+
+
+def _resolve_openai_compatible_config() -> Dict[str, Any]:
+    """Resolve OpenAI-compatible image generation settings."""
+    img_cfg = _load_image_gen_config()
+
+    base_url = str(img_cfg.get("base_url") or os.getenv("IMAGE_GEN_BASE_URL", "")).strip()
+    model = str(
+        img_cfg.get("model")
+        or os.getenv("IMAGE_GEN_MODEL", "")
+        or DEFAULT_OPENAI_COMPATIBLE_MODEL
+    ).strip()
+    response_format = str(
+        img_cfg.get("response_format")
+        or os.getenv("IMAGE_GEN_RESPONSE_FORMAT", "")
+        or DEFAULT_OPENAI_COMPATIBLE_RESPONSE_FORMAT
+    ).strip()
+
+    api_key = str(img_cfg.get("api_key") or os.getenv("IMAGE_GEN_API_KEY", "")).strip()
+    if not api_key:
+        try:
+            from hermes_cli.config import get_env_value
+
+            api_key = str(get_env_value("IMAGE_GEN_API_KEY") or "").strip()
+        except Exception:
+            api_key = ""
+
+    timeout_raw = img_cfg.get("timeout", 120)
+    try:
+        timeout = float(timeout_raw)
+    except (TypeError, ValueError):
+        timeout = 120.0
+
+    extra_body = img_cfg.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+
+    return {
+        "base_url": base_url.rstrip("/"),
+        "api_key": api_key,
+        "model": model,
+        "response_format": response_format,
+        "timeout": timeout,
+        "extra_body": extra_body,
+    }
+
+
+def _openai_compatible_key_is_configured() -> bool:
+    cfg = _resolve_openai_compatible_config()
+    return bool(cfg["base_url"] and cfg["api_key"] and cfg["model"])
 
 
 # ---------------------------------------------------------------------------
@@ -492,16 +577,10 @@ def _resolve_fal_model() -> tuple:
     configured model is unknown (logged as a warning).
     """
     model_id = ""
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        img_cfg = cfg.get("image_gen") if isinstance(cfg, dict) else None
-        if isinstance(img_cfg, dict):
-            raw = img_cfg.get("model")
-            if isinstance(raw, str):
-                model_id = raw.strip()
-    except Exception as exc:
-        logger.debug("Could not load image_gen.model from config: %s", exc)
+    img_cfg = _load_image_gen_config()
+    raw = img_cfg.get("model")
+    if isinstance(raw, str):
+        model_id = raw.strip()
 
     # Env var escape hatch (undocumented; backward-compat for tests/scripts).
     if not model_id:
@@ -561,6 +640,149 @@ def _build_fal_payload(
 
     supports = meta["supports"]
     return {k: v for k, v in payload.items() if k in supports}
+
+
+def _build_openai_compatible_payload(
+    prompt: str,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    *,
+    model: Optional[str] = None,
+    response_format: Optional[str] = None,
+    num_images: Optional[int] = None,
+    seed: Optional[int] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build an OpenAI-compatible /images/generations payload."""
+    aspect = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
+    if aspect not in OPENAI_COMPATIBLE_SIZES:
+        aspect = DEFAULT_ASPECT_RATIO
+
+    payload: Dict[str, Any] = {
+        "model": (model or DEFAULT_OPENAI_COMPATIBLE_MODEL).strip(),
+        "prompt": (prompt or "").strip(),
+        "response_format": (
+            response_format or DEFAULT_OPENAI_COMPATIBLE_RESPONSE_FORMAT
+        ).strip(),
+    }
+    if num_images is not None:
+        payload["n"] = num_images
+    if seed is not None:
+        payload["seed"] = seed
+
+    if extra_body:
+        payload.update({k: v for k, v in extra_body.items() if v is not None})
+
+    # Some OpenAI-compatible image gateways accept size; keep it out by
+    # default so minimal proxy endpoints that mirror OpenAI's sample payloads
+    # keep working. Users can opt in via image_gen.extra_body.size.
+    payload.setdefault("size", None)
+    if payload["size"] is None:
+        payload.pop("size")
+
+    return payload
+
+
+def _image_output_dir() -> Path:
+    img_cfg = _load_image_gen_config()
+    raw_dir = str(img_cfg.get("output_dir") or "").strip()
+    if raw_dir:
+        return Path(raw_dir).expanduser()
+
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "images" / "generated"
+
+
+def _save_b64_image(b64_data: str, *, extension: str = "png") -> str:
+    """Decode a base64 image response to a profile-scoped local file."""
+    clean = str(b64_data or "").strip()
+    if clean.startswith("data:"):
+        _, _, clean = clean.partition(",")
+    if not clean:
+        raise ValueError("Image response contained empty b64_json data")
+
+    image_bytes = base64.b64decode(clean, validate=True)
+    if not image_bytes:
+        raise ValueError("Image response decoded to an empty file")
+    out_dir = _image_output_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    suffix = extension.lstrip(".") or "png"
+    out_path = out_dir / f"image-{uuid.uuid4().hex}.{suffix}"
+    out_path.write_bytes(image_bytes)
+    return str(out_path)
+
+
+def _extract_openai_compatible_image(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the first image from an OpenAI-compatible response."""
+    images = data.get("data")
+    if not isinstance(images, list) or not images:
+        raise ValueError("Invalid OpenAI-compatible image response: missing data[]")
+
+    first = images[0]
+    if not isinstance(first, dict):
+        raise ValueError("Invalid OpenAI-compatible image response: data[0] is not an object")
+
+    if first.get("url"):
+        return {"url": first["url"], "path": None}
+
+    b64_data = first.get("b64_json")
+    if b64_data:
+        path = _save_b64_image(str(b64_data))
+        return {"url": path, "path": path}
+
+    raise ValueError("OpenAI-compatible image response had no url or b64_json")
+
+
+def _generate_openai_compatible_image(
+    prompt: str,
+    aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+    num_images: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Generate an image via an OpenAI-compatible /images/generations endpoint."""
+    cfg = _resolve_openai_compatible_config()
+    if not cfg["base_url"]:
+        raise ValueError("image_gen.base_url is required for openai_compatible image generation")
+    if not cfg["api_key"]:
+        raise ValueError("IMAGE_GEN_API_KEY is required for openai_compatible image generation")
+    if not cfg["model"]:
+        raise ValueError("image_gen.model is required for openai_compatible image generation")
+
+    payload = _build_openai_compatible_payload(
+        prompt,
+        aspect_ratio,
+        model=cfg["model"],
+        response_format=cfg["response_format"],
+        num_images=num_images,
+        seed=seed,
+        extra_body=cfg["extra_body"],
+    )
+    url = f"{cfg['base_url']}/images/generations"
+
+    logger.info(
+        "Generating image with OpenAI-compatible backend (%s) via %s",
+        cfg["model"], cfg["base_url"],
+    )
+
+    with httpx.Client(timeout=cfg["timeout"]) as client:
+        response = client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {cfg['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        body = response.json()
+
+    extracted = _extract_openai_compatible_image(body)
+    return {
+        "model": cfg["model"],
+        "image": extracted["url"],
+        "image_path": extracted["path"],
+        "raw": body,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -624,19 +846,25 @@ def image_generate_tool(
     output_format: Optional[str] = None,
     seed: Optional[int] = None,
 ) -> str:
-    """Generate an image from a text prompt using the configured FAL model.
+    """Generate an image from a text prompt using the configured backend.
 
     The agent-facing schema exposes only ``prompt`` and ``aspect_ratio``; the
     remaining kwargs are overrides for direct Python callers and are filtered
-    per-model via the ``supports`` whitelist (unsupported overrides are
-    silently dropped so legacy callers don't break when switching models).
+    per-backend so legacy callers don't break when switching models.
 
     Returns a JSON string with ``{"success": bool, "image": url | None,
     "error": str, "error_type": str}``.
     """
-    model_id, meta = _resolve_fal_model()
+    backend = _resolve_image_backend()
+    if backend == "openai_compatible":
+        openai_cfg = _resolve_openai_compatible_config()
+        model_id = openai_cfg["model"]
+        meta = {"display": f"OpenAI-compatible:{model_id}", "upscale": False}
+    else:
+        model_id, meta = _resolve_fal_model()
 
     debug_call_data = {
+        "backend": backend,
         "model": model_id,
         "parameters": {
             "prompt": prompt,
@@ -659,12 +887,6 @@ def image_generate_tool(
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
 
-        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
-            message = "FAL_KEY environment variable not set"
-            if managed_nous_tools_enabled():
-                message += " and managed FAL gateway is unavailable"
-            raise ValueError(message)
-
         aspect_lc = (aspect_ratio or DEFAULT_ASPECT_RATIO).lower().strip()
         if aspect_lc not in VALID_ASPECT_RATIOS:
             logger.warning(
@@ -682,6 +904,36 @@ def image_generate_tool(
             overrides["num_images"] = num_images
         if output_format is not None:
             overrides["output_format"] = output_format
+
+        if backend == "openai_compatible":
+            generated = _generate_openai_compatible_image(
+                prompt,
+                aspect_lc,
+                num_images=num_images,
+                seed=seed,
+            )
+            generation_time = (datetime.datetime.now() - start_time).total_seconds()
+            response_data = {
+                "success": True,
+                "image": generated["image"],
+            }
+            if generated.get("image_path"):
+                response_data["image_path"] = generated["image_path"]
+                response_data["media"] = f"MEDIA:{generated['image_path']}"
+
+            debug_call_data["success"] = True
+            debug_call_data["images_generated"] = 1
+            debug_call_data["generation_time"] = generation_time
+            _debug.log_call("image_generate_tool", debug_call_data)
+            _debug.save()
+
+            return json.dumps(response_data, indent=2, ensure_ascii=False)
+
+        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
+            message = "FAL_KEY environment variable not set"
+            if managed_nous_tools_enabled():
+                message += " and managed FAL gateway is unavailable"
+            raise ValueError(message)
 
         arguments = _build_fal_payload(
             model_id, prompt, aspect_lc, seed=seed, overrides=overrides,
@@ -774,7 +1026,10 @@ def check_fal_api_key() -> bool:
 
 
 def check_image_generation_requirements() -> bool:
-    """True if FAL credentials and fal_client SDK are both available."""
+    """True if the configured image backend has its required credentials."""
+    if _resolve_image_backend() == "openai_compatible":
+        return _openai_compatible_key_is_configured()
+
     try:
         if not check_fal_api_key():
             return False
@@ -827,10 +1082,11 @@ from tools.registry import registry, tool_error
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts using FAL.ai. "
-        "The underlying model is user-configured (default: FLUX 2 Klein 9B, "
-        "sub-1s generation) and is not selectable by the agent. Returns a "
-        "single image URL. Display it using markdown: ![description](URL)"
+        "Generate high-quality images from text prompts using the user's "
+        "configured image backend. The underlying backend/model is "
+        "user-configured and is not selectable by the agent. Returns a "
+        "single image URL or local image path. Display it using markdown: "
+        "![description](URL_OR_PATH)"
     ),
     "parameters": {
         "type": "object",

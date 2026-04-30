@@ -278,6 +278,15 @@ TOOL_CATEGORIES = {
                 ],
                 "imagegen_backend": "fal",
             },
+            {
+                "name": "OpenAI-compatible",
+                "badge": "custom",
+                "tag": "Use any /v1/images/generations compatible endpoint",
+                "env_vars": [
+                    {"key": "IMAGE_GEN_API_KEY", "prompt": "Image generation API key"},
+                ],
+                "imagegen_backend": "openai_compatible",
+            },
         ],
     },
     "browser": {
@@ -876,7 +885,14 @@ def _toolset_needs_configuration_prompt(ts_key: str, config: dict) -> bool:
         browser_cfg = config.get("browser", {})
         return not isinstance(browser_cfg, dict) or "cloud_provider" not in browser_cfg
     if ts_key == "image_gen":
-        return not fal_key_is_configured()
+        img_cfg = config.get("image_gen", {})
+        if isinstance(img_cfg, dict) and img_cfg.get("backend") == "openai_compatible":
+            return not (
+                get_env_value("IMAGE_GEN_API_KEY")
+                and img_cfg.get("base_url")
+                and img_cfg.get("model")
+            )
+        return not (fal_key_is_configured() or get_env_value("IMAGE_GEN_API_KEY"))
 
     return not _toolset_has_keys(ts_key, config)
 
@@ -980,6 +996,12 @@ def _is_provider_active(provider: dict, config: dict) -> bool:
     if provider.get("web_backend"):
         current = config.get("web", {}).get("backend")
         return current == provider["web_backend"]
+    if provider.get("imagegen_backend"):
+        backend = provider["imagegen_backend"]
+        current = config.get("image_gen", {})
+        if not isinstance(current, dict):
+            return backend == "fal"
+        return (current.get("backend") or "fal") == backend
     return False
 
 
@@ -1014,11 +1036,34 @@ def _fal_model_catalog():
     return FAL_MODELS, DEFAULT_MODEL
 
 
+OPENAI_COMPATIBLE_IMAGE_MODELS = {
+    "gpt-image-2": {
+        "speed": "varies",
+        "strengths": "OpenAI-compatible endpoint",
+        "price": "provider",
+    },
+    "gpt-image-1.5": {
+        "speed": "varies",
+        "strengths": "OpenAI-compatible endpoint",
+        "price": "provider",
+    },
+}
+
+
+def _openai_compatible_model_catalog():
+    return OPENAI_COMPATIBLE_IMAGE_MODELS, "gpt-image-2"
+
+
 IMAGEGEN_BACKENDS = {
     "fal": {
         "display": "FAL.ai",
         "config_key": "image_gen",
         "catalog_fn": _fal_model_catalog,
+    },
+    "openai_compatible": {
+        "display": "OpenAI-compatible",
+        "config_key": "image_gen",
+        "catalog_fn": _openai_compatible_model_catalog,
     },
 }
 
@@ -1053,6 +1098,7 @@ def _configure_imagegen_model(backend_name: str, config: dict) -> None:
     if not isinstance(cur_cfg, dict):
         cur_cfg = {}
         config[cfg_key] = cur_cfg
+    cur_cfg["backend"] = backend_name
     current_model = cur_cfg.get("model") or default_model
     if current_model not in catalog:
         current_model = default_model
@@ -1094,6 +1140,22 @@ def _configure_imagegen_model(backend_name: str, config: dict) -> None:
     cur_cfg["model"] = chosen
     _print_success(f"  Model set to: {chosen}")
 
+    if backend_name == "openai_compatible":
+        model = _prompt("  Model", chosen).strip()
+        if model:
+            cur_cfg["model"] = model
+        current_base_url = str(cur_cfg.get("base_url") or "").strip()
+        default_base_url = current_base_url or "https://api.openai.com/v1"
+        base_url = _prompt("  Base URL", default_base_url).strip()
+        if base_url:
+            cur_cfg["base_url"] = base_url.rstrip("/")
+        cur_cfg["response_format"] = str(
+            cur_cfg.get("response_format") or "b64_json"
+        ).strip() or "b64_json"
+        cur_cfg.setdefault("timeout", 120)
+        cur_cfg.setdefault("extra_body", {})
+        _print_success(f"  Base URL set to: {cur_cfg.get('base_url', '')}")
+
 
 def _configure_provider(provider: dict, config: dict):
     """Configure a single provider - prompt for API keys and set config."""
@@ -1130,6 +1192,14 @@ def _configure_provider(provider: dict, config: dict):
         web_cfg["backend"] = provider["web_backend"]
         web_cfg["use_gateway"] = bool(managed_feature)
         _print_success(f"  Web backend set to: {provider['web_backend']}")
+
+    backend = provider.get("imagegen_backend")
+    if backend:
+        img_cfg = config.setdefault("image_gen", {})
+        if not isinstance(img_cfg, dict):
+            img_cfg = {}
+            config["image_gen"] = img_cfg
+        img_cfg["backend"] = backend
 
     # For tools without a specific config key (e.g. image_gen), still
     # track use_gateway so the runtime knows the user's intent.

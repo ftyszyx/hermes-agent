@@ -462,6 +462,18 @@ DEFAULT_CONFIG = {
         },
     },
 
+    "image_gen": {
+        "backend": "fal",       # fal | openai_compatible
+        "model": "",           # FAL model id, or OpenAI-compatible image model
+        "base_url": "",        # OpenAI-compatible base URL, e.g. https://host/v1
+        "api_key": "",         # Optional fallback; prefer IMAGE_GEN_API_KEY in .env
+        "response_format": "b64_json",
+        "timeout": 120,
+        "output_dir": "",      # Empty = <HERMES_HOME>/cache/images/generated
+        "extra_body": {},      # Provider-specific fields such as {"size": "1024x1024"}
+        "use_gateway": False,
+    },
+
     # Filesystem checkpoints — automatic snapshots before destructive file ops.
     # When enabled, the agent takes a snapshot of the working directory once per
     # conversation turn (on first write_file/patch call).  Use /rollback to restore.
@@ -901,7 +913,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 22,
+    "_config_version": 23,
 }
 
 # =============================================================================
@@ -917,6 +929,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
     10: ["TAVILY_API_KEY"],
     11: ["TERMINAL_MODAL_MODE"],
+    23: ["IMAGE_GEN_API_KEY"],
 }
 
 # Required environment variables with metadata for migration prompts.
@@ -1377,6 +1390,13 @@ OPTIONAL_ENV_VARS = {
         "description": "FAL API key for image generation",
         "prompt": "FAL API key",
         "url": "https://fal.ai/",
+        "tools": ["image_generate"],
+        "password": True,
+        "category": "tool",
+    },
+    "IMAGE_GEN_API_KEY": {
+        "description": "API key for OpenAI-compatible image generation",
+        "prompt": "Image generation API key",
         "tools": ["image_generate"],
         "password": True,
         "category": "tool",
@@ -2112,7 +2132,7 @@ def check_config_version() -> Tuple[int, int]:
 _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
-    "agent", "terminal", "display", "compression", "delegation",
+    "agent", "terminal", "display", "compression", "delegation", "image_gen",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
 }
 
@@ -3611,6 +3631,7 @@ def show_config():
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("BROWSER_USE_API_KEY", "Browser Use"),
         ("FAL_KEY", "FAL"),
+        ("IMAGE_GEN_API_KEY", "Image Gen"),
     ]
     
     for env_key, name in keys:

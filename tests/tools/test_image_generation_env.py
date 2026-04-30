@@ -37,3 +37,20 @@ def test_fal_key_empty_is_unset(monkeypatch):
     )
 
     assert image_generation_tool.check_fal_api_key() is False
+
+
+def test_openai_compatible_requirements_use_image_gen_key(monkeypatch):
+    from tools import image_generation_tool
+
+    monkeypatch.setenv("IMAGE_GEN_API_KEY", "img-key")
+    monkeypatch.setattr(
+        image_generation_tool,
+        "_load_image_gen_config",
+        lambda: {
+            "backend": "openai_compatible",
+            "base_url": "https://sub2api.1postpro.com/v1",
+            "model": "gpt-image-2",
+        },
+    )
+
+    assert image_generation_tool.check_image_generation_requirements() is True
