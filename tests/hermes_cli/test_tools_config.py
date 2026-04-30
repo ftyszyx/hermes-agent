@@ -645,6 +645,7 @@ class TestImagegenModelPicker:
         assert config["image_gen"]["model"] == "gpt-image-2"
         assert config["image_gen"]["base_url"] == "https://sub2api.1postpro.com/v1"
         assert config["image_gen"]["response_format"] == "b64_json"
+        assert config["image_gen"]["stream"] is True
 
     def test_picker_with_gpt_image_does_not_prompt_quality(self):
         """GPT-Image quality is pinned to medium in the tool's defaults —

@@ -368,6 +368,14 @@ class TestOpenAICompatibleBackend:
             "response_format": "b64_json",
         }
 
+    def test_openai_compatible_payload_can_enable_stream(self, image_tool):
+        payload = image_tool._build_openai_compatible_payload(
+            "a red panda on a bicycle",
+            model="gpt-image-2",
+            stream=True,
+        )
+        assert payload["stream"] is True
+
     def test_openai_compatible_extra_body_can_add_size(self, image_tool):
         payload = image_tool._build_openai_compatible_payload(
             "hello",
@@ -397,6 +405,52 @@ class TestOpenAICompatibleBackend:
         assert path is not None
         assert path.endswith(".png")
         assert open(path, "rb").read() == raw
+
+    def test_extracts_data_url_response_to_local_file(self, image_tool, tmp_path):
+        raw = b"fake-png-bytes"
+        b64 = base64.b64encode(raw).decode("ascii")
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {"output_dir": str(tmp_path)}}):
+            extracted = image_tool._extract_openai_compatible_image({
+                "url": f"data:image/png;base64,{b64}",
+            })
+        assert extracted["path"] is not None
+        assert open(extracted["path"], "rb").read() == raw
+
+    def test_consumes_sub2api_sse_completed_event(self, image_tool):
+        class FakeStreamResponse:
+            def iter_lines(self):
+                yield "event: image_generation.partial_image"
+                yield 'data: {"type":"image_generation.partial_image","b64_json":"cGFydGlhbA=="}'
+                yield ""
+                yield "event: image_generation.completed"
+                yield 'data: {"type":"image_generation.completed","b64_json":"ZmluYWw=","model":"gpt-image-2"}'
+                yield ""
+
+        payload = image_tool._consume_openai_compatible_stream(FakeStreamResponse())
+        assert payload["type"] == "image_generation.completed"
+        assert payload["b64_json"] == "ZmluYWw="
+
+    def test_openai_compatible_config_defaults_stream_on(self, image_tool):
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {
+                       "backend": "openai_compatible",
+                       "base_url": "https://example.com/v1",
+                       "model": "gpt-image-2",
+                   }}):
+            cfg = image_tool._resolve_openai_compatible_config()
+        assert cfg["stream"] is True
+
+    def test_openai_compatible_config_can_disable_stream(self, image_tool):
+        with patch("hermes_cli.config.load_config",
+                   return_value={"image_gen": {
+                       "backend": "openai_compatible",
+                       "base_url": "https://example.com/v1",
+                       "model": "gpt-image-2",
+                       "stream": False,
+                   }}):
+            cfg = image_tool._resolve_openai_compatible_config()
+        assert cfg["stream"] is False
 
     def test_image_generate_dispatches_to_openai_compatible(self, image_tool):
         with patch("hermes_cli.config.load_config",

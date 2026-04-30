@@ -569,6 +569,7 @@ DEFAULT_CONFIG = {
         "base_url": "",        # OpenAI-compatible base URL, e.g. https://host/v1
         "api_key": "",         # Optional fallback; prefer IMAGE_GEN_API_KEY in .env
         "response_format": "b64_json",
+        "stream": True,        # OpenAI-compatible backend: use SSE to avoid long blocking requests
         "timeout": 120,
         "output_dir": "",      # Empty = <HERMES_HOME>/cache/images/generated
         "extra_body": {},      # Provider-specific fields such as {"size": "1024x1024"}

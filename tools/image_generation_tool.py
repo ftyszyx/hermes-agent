@@ -366,6 +366,11 @@ def _resolve_openai_compatible_config() -> Dict[str, Any]:
         or os.getenv("IMAGE_GEN_RESPONSE_FORMAT", "")
         or DEFAULT_OPENAI_COMPATIBLE_RESPONSE_FORMAT
     ).strip()
+    stream = img_cfg.get("stream", True)
+    if isinstance(stream, str):
+        stream = stream.strip().lower() not in {"0", "false", "no", "off"}
+    else:
+        stream = bool(stream)
 
     api_key = str(img_cfg.get("api_key") or os.getenv("IMAGE_GEN_API_KEY", "")).strip()
     if not api_key:
@@ -391,6 +396,7 @@ def _resolve_openai_compatible_config() -> Dict[str, Any]:
         "api_key": api_key,
         "model": model,
         "response_format": response_format,
+        "stream": stream,
         "timeout": timeout,
         "extra_body": extra_body,
     }
@@ -648,6 +654,7 @@ def _build_openai_compatible_payload(
     *,
     model: Optional[str] = None,
     response_format: Optional[str] = None,
+    stream: bool = False,
     num_images: Optional[int] = None,
     seed: Optional[int] = None,
     extra_body: Optional[Dict[str, Any]] = None,
@@ -668,6 +675,8 @@ def _build_openai_compatible_payload(
         payload["n"] = num_images
     if seed is not None:
         payload["seed"] = seed
+    if stream:
+        payload["stream"] = True
 
     if extra_body:
         payload.update({k: v for k, v in extra_body.items() if v is not None})
@@ -714,6 +723,18 @@ def _save_b64_image(b64_data: str, *, extension: str = "png") -> str:
 
 def _extract_openai_compatible_image(data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the first image from an OpenAI-compatible response."""
+    direct_url = data.get("url")
+    if isinstance(direct_url, str) and direct_url:
+        if direct_url.startswith("data:"):
+            path = _save_b64_image(direct_url)
+            return {"url": path, "path": path}
+        return {"url": direct_url, "path": None}
+
+    direct_b64 = data.get("b64_json")
+    if direct_b64:
+        path = _save_b64_image(str(direct_b64))
+        return {"url": path, "path": path}
+
     images = data.get("data")
     if not isinstance(images, list) or not images:
         raise ValueError("Invalid OpenAI-compatible image response: missing data[]")
@@ -723,7 +744,11 @@ def _extract_openai_compatible_image(data: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Invalid OpenAI-compatible image response: data[0] is not an object")
 
     if first.get("url"):
-        return {"url": first["url"], "path": None}
+        url = str(first["url"])
+        if url.startswith("data:"):
+            path = _save_b64_image(url)
+            return {"url": path, "path": path}
+        return {"url": url, "path": None}
 
     b64_data = first.get("b64_json")
     if b64_data:
@@ -731,6 +756,79 @@ def _extract_openai_compatible_image(data: Dict[str, Any]) -> Dict[str, Any]:
         return {"url": path, "path": path}
 
     raise ValueError("OpenAI-compatible image response had no url or b64_json")
+
+
+def _iter_sse_events(response) -> Any:
+    """Yield (event_name, payload_dict) from a text/event-stream response."""
+    event_name = ""
+    data_lines = []
+
+    def flush():
+        nonlocal event_name, data_lines
+        if not data_lines:
+            event_name = ""
+            return None
+        raw_data = "\n".join(data_lines).strip()
+        name = event_name
+        event_name = ""
+        data_lines = []
+        if not raw_data or raw_data == "[DONE]":
+            return None
+        try:
+            payload = json.loads(raw_data)
+        except json.JSONDecodeError:
+            logger.debug("Skipping non-JSON image SSE payload: %s", raw_data[:200])
+            return None
+        return name, payload
+
+    for line in response.iter_lines():
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
+        line = str(line).rstrip("\r")
+        if not line:
+            item = flush()
+            if item is not None:
+                yield item
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+    item = flush()
+    if item is not None:
+        yield item
+
+
+def _consume_openai_compatible_stream(response) -> Dict[str, Any]:
+    """Consume a Sub2API/OpenAI-compatible image SSE stream and return final payload."""
+    final_payload = None
+    latest_partial = None
+    partial_count = 0
+
+    for event_name, payload in _iter_sse_events(response):
+        event_type = str(payload.get("type") or event_name or "")
+        if event_type.endswith(".partial_image"):
+            latest_partial = payload
+            partial_count += 1
+            logger.info("Received image partial event %s", partial_count)
+            continue
+        if event_type.endswith(".completed"):
+            final_payload = payload
+            break
+        if payload.get("b64_json") or payload.get("url") or payload.get("data"):
+            final_payload = payload
+
+    if final_payload is None:
+        if latest_partial is not None:
+            logger.warning("Image stream ended without completed event; using latest partial image")
+            final_payload = latest_partial
+        else:
+            raise ValueError("OpenAI-compatible image stream ended without an image payload")
+
+    return final_payload
 
 
 def _generate_openai_compatible_image(
@@ -753,6 +851,7 @@ def _generate_openai_compatible_image(
         aspect_ratio,
         model=cfg["model"],
         response_format=cfg["response_format"],
+        stream=cfg["stream"],
         num_images=num_images,
         seed=seed,
         extra_body=cfg["extra_body"],
@@ -764,17 +863,22 @@ def _generate_openai_compatible_image(
         cfg["model"], cfg["base_url"],
     )
 
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+    if cfg["stream"]:
+        headers["Accept"] = "text/event-stream"
+
     with httpx.Client(timeout=cfg["timeout"]) as client:
-        response = client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {cfg['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        response.raise_for_status()
-        body = response.json()
+        if cfg["stream"]:
+            with client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                body = _consume_openai_compatible_stream(response)
+        else:
+            response = client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.json()
 
     extracted = _extract_openai_compatible_image(body)
     return {

@@ -1561,6 +1561,7 @@ def _configure_imagegen_model(backend_name: str, config: dict) -> None:
         cur_cfg["response_format"] = str(
             cur_cfg.get("response_format") or "b64_json"
         ).strip() or "b64_json"
+        cur_cfg.setdefault("stream", True)
         cur_cfg.setdefault("timeout", 120)
         cur_cfg.setdefault("extra_body", {})
         _print_success(f"  Base URL set to: {cur_cfg.get('base_url', '')}")
